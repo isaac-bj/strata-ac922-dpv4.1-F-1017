@@ -350,6 +350,7 @@ private:
     void* d_ple_v_ = nullptr;
     void* d_ple_gv_ = nullptr;
     void* d_ple_gvn_ = nullptr;
+    void* d_ple_verify_gvn_ = nullptr;
     void* d_ple_conv_state_ = nullptr;
 
     void* d_gdn_qkv_ = nullptr;

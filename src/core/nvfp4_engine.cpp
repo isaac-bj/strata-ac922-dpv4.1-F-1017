@@ -519,18 +519,19 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                 void* args_v[] = {&d_ple_embed_, &ple_.value_proj, &d_ple_v_, &M};
                 kernels_.launch("bf16_linear_2560_2560", 40, m_tiles16, 1, args_v);
             }
+            void* ple_gvn_buf = (M <= 4) ? d_ple_verify_gvn_ : d_ple_gvn_;
             {
                 void* args[] = {&d_ple_k_, &d_ple_v_, &cur_x, &ple_.norm_key, &ple_.norm_query,
-                                &ple_.norm_conv, &d_ple_gv_, &d_ple_gvn_, &eps};
+                                &ple_.norm_conv, &d_ple_gv_, &ple_gvn_buf, &eps};
                 kernels_.launch("ple_gate", M, 1, 1, args);
             }
             {
-                void* args[] = {&cur_x, &d_ple_gv_, &d_ple_gvn_, &d_ple_conv_state_, &ple_.conv_weight, &alt_x, &M};
+                void* args[] = {&cur_x, &d_ple_gv_, &ple_gvn_buf, &d_ple_conv_state_, &ple_.conv_weight, &alt_x, &M};
                 kernels_.launch("ple_conv_add", (M * 1280 + 255) / 256, 1, 1, args);
                 std::swap(cur_x, alt_x);
             }
             for (int32_t t = 0; t < M; ++t) {
-                void* gvn_t = static_cast<uint16_t*>(d_ple_gvn_) + static_cast<size_t>(t) * 10240;
+                void* gvn_t = static_cast<uint16_t*>(ple_gvn_buf) + static_cast<size_t>(t) * 10240;
                 void* args[] = {&d_ple_conv_state_, &gvn_t};
                 kernels_.launch_default("ple_state_update", args);
             }
@@ -891,8 +892,47 @@ void Qwen4ExpGfx1201Engine::fetch_ple_rows_cached(const int32_t* tokens, const i
     uint8_t** miss_user_dsts = ple_miss_user_dsts_.data();
     int n_miss = 0;
 
+    if (h_ple_dst != nullptr) {
+        for (int32_t t = 0; t < M; ++t) {
+            uint8_t* dst_2560 = h_ple_dst + static_cast<size_t>(t) * 2560;
+            uint32_t rows16[16]{};
+            const int32_t prev_pair[2] = {prev0s[t], prev1s[t]};
+            strata::kernels::ngram_rows(&tokens[t], prev_pair, 1, ple_consts_, rows16);
+            for (int h = 0; h < 16; ++h) {
+                uint32_t r = rows16[h];
+                uint32_t shard = r / 2500012u;
+                uint32_t row_in_shard = r % 2500012u;
+                uint64_t off = ple_.shard_offsets[shard] + static_cast<uint64_t>(row_in_shard) * 160ULL;
+                uint8_t* user_dst = dst_2560 + h * 160;
+                if (!ple_cache_.empty()) {
+                    size_t slot = static_cast<size_t>(((off / 160ULL) * 0x9E3779B97F4A7C15ULL) >> 52) & (kPleCacheSlots - 1);
+                    const PleCacheEntry& ce = ple_cache_[slot];
+                    if (ce.off == off) {
+                        std::memcpy(user_dst, ce.data, 160);
+                        continue;
+                    }
+                }
+                miss_offs[n_miss] = off;
+                miss_user_dsts[n_miss] = user_dst;
+                n_miss++;
+            }
+        }
+        if (n_miss > 0) {
+            cpu_pool_.run_ple_reads(ple_.ple_fd, miss_offs, miss_user_dsts, n_miss);
+            if (!ple_cache_.empty()) {
+                for (int i = 0; i < n_miss; ++i) {
+                    uint64_t off = miss_offs[i];
+                    size_t slot = static_cast<size_t>(((off / 160ULL) * 0x9E3779B97F4A7C15ULL) >> 52) & (kPleCacheSlots - 1);
+                    PleCacheEntry& ce = ple_cache_[slot];
+                    ce.off = off;
+                    std::memcpy(ce.data, miss_user_dsts[i], 160);
+                }
+            }
+        }
+        return;
+    }
+
     for (int32_t t = 0; t < M; ++t) {
-        uint8_t* dst_2560 = h_ple_dst ? (h_ple_dst + static_cast<size_t>(t) * 2560) : nullptr;
         uint32_t rows16[16]{};
         const int32_t prev_pair[2] = {prev0s[t], prev1s[t]};
         strata::kernels::ngram_rows(&tokens[t], prev_pair, 1, ple_consts_, rows16);
@@ -901,25 +941,15 @@ void Qwen4ExpGfx1201Engine::fetch_ple_rows_cached(const int32_t* tokens, const i
             uint32_t shard = r / 2500012u;
             uint32_t row_in_shard = r % 2500012u;
             uint64_t off = ple_.shard_offsets[shard] + static_cast<uint64_t>(row_in_shard) * 160ULL;
-            uint8_t* user_dst = dst_2560 ? (dst_2560 + h * 160) : nullptr;
             if (!ple_cache_.empty()) {
                 size_t slot = static_cast<size_t>(((off / 160ULL) * 0x9E3779B97F4A7C15ULL) >> 52) & (kPleCacheSlots - 1);
                 PleCacheEntry& ce = ple_cache_[slot];
-                if (ce.off == off) {
-                    if (user_dst) {
-                        std::memcpy(user_dst, ce.data, 160);
-                    }
+                if (ce.off != ~0ULL) {
                     continue;
                 }
                 ce.off = off;
                 miss_offs[n_miss] = off;
                 miss_cache_dsts[n_miss] = ce.data;
-                miss_user_dsts[n_miss] = user_dst;
-                n_miss++;
-            } else if (user_dst) {
-                miss_offs[n_miss] = off;
-                miss_cache_dsts[n_miss] = user_dst;
-                miss_user_dsts[n_miss] = nullptr;
                 n_miss++;
             }
         }
@@ -927,11 +957,6 @@ void Qwen4ExpGfx1201Engine::fetch_ple_rows_cached(const int32_t* tokens, const i
 
     if (n_miss > 0) {
         cpu_pool_.run_ple_reads(ple_.ple_fd, miss_offs, miss_cache_dsts, n_miss);
-        for (int i = 0; i < n_miss; ++i) {
-            if (miss_user_dsts[i]) {
-                std::memcpy(miss_user_dsts[i], miss_cache_dsts[i], 160);
-            }
-        }
     }
 }
 
@@ -1147,7 +1172,7 @@ void Qwen4ExpGfx1201Engine::finish_verify_step(int32_t M, int32_t n_adv) {
     if (n_adv < M) {
         restore_recurrent_ckpt();
         for (int32_t t = 0; t < n_adv; ++t) {
-            void* gvn_t = static_cast<uint16_t*>(d_ple_gvn_) + static_cast<size_t>(t) * 10240;
+            void* gvn_t = static_cast<uint16_t*>(d_ple_verify_gvn_) + static_cast<size_t>(t) * 10240;
             void* args[] = {&d_ple_conv_state_, &gvn_t};
             kernels_.launch_default("ple_state_update", args);
         }
@@ -2168,6 +2193,7 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
 
     d_mtp_r_ring_ = gpu_alloc(static_cast<size_t>(kMtpRingCap) * 10240 * sizeof(uint16_t), true);
     d_mtp_r_state_ = gpu_alloc(10240 * sizeof(uint16_t), true);
+    d_ple_verify_gvn_ = gpu_alloc(4 * 10240 * sizeof(uint16_t), true);
     d_argmax_summary_ = gpu_alloc(4 * sizeof(strata::kernels::Nvfp4ArgmaxSummary));
     d_moe_gpu_align_ids_ = gpu_alloc(B * 10 * sizeof(int32_t));
     d_mtp_dvocab_ = static_cast<int32_t*>(gpu_alloc(65536 * sizeof(int32_t), true));
