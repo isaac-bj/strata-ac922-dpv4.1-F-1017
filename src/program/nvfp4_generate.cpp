@@ -555,6 +555,10 @@ int run_nvfp4(int argc, char** argv) {
                         bool hit_eos = false;
                         for (int32_t j = 0; j < accepted; ++j) {
                             if (draft[j] == 248044 || draft[j] == 248046) {
+                                std::printf("T %d\n", draft[j]);
+                                std::fflush(stdout);
+                                generated++;
+                                history.resize(static_cast<size_t>(pos0 + 1 + j));
                                 finish_reason = "stop";
                                 hit_eos = true;
                                 break;
