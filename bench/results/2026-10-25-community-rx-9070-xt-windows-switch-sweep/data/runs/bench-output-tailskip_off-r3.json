@@ -1,0 +1,257 @@
+{
+  "started": "2026-10-25 02:47:54",
+  "url": "http://127.0.0.1:8091/v1/chat/completions",
+  "model": "qwen3.8-flash-next-iq3_xxs",
+  "engine_log": "<data>\\bench\\sweep-rx9070xt\\engine.log",
+  "cap_tokens": 256,
+  "reps": 3,
+  "speed": [
+    {
+      "ok": true,
+      "payload_variant": 0,
+      "thinking_off": true,
+      "ttft_s": 5.401,
+      "total_s": 8.417,
+      "answer_len": 1310,
+      "reasoning_len": 0,
+      "reasoning_text": "",
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 4195,
+        "completion_tokens": 256,
+        "total_tokens": 4451,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "engine_prompt_tokens": 4195,
+      "reused_tokens": 0,
+      "new_prompt_tokens": 4195,
+      "read_ms": 5368,
+      "read_tok_s": 781.5,
+      "generated_tokens": 256,
+      "gen_ms": 3032,
+      "decode_tok_s": 84.4,
+      "pairing_ok": true,
+      "target": 4096,
+      "rep": 1,
+      "chars": 10535
+    },
+    {
+      "ok": true,
+      "payload_variant": 0,
+      "thinking_off": true,
+      "ttft_s": 5.418,
+      "total_s": 8.341,
+      "answer_len": 1306,
+      "reasoning_len": 0,
+      "reasoning_text": "",
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 4198,
+        "completion_tokens": 256,
+        "total_tokens": 4454,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "engine_prompt_tokens": 4198,
+      "reused_tokens": 0,
+      "new_prompt_tokens": 4198,
+      "read_ms": 5372,
+      "read_tok_s": 781.4,
+      "generated_tokens": 256,
+      "gen_ms": 2943,
+      "decode_tok_s": 87.0,
+      "pairing_ok": true,
+      "target": 4096,
+      "rep": 2,
+      "chars": 10535
+    },
+    {
+      "ok": true,
+      "payload_variant": 0,
+      "thinking_off": true,
+      "ttft_s": 5.428,
+      "total_s": 8.334,
+      "answer_len": 1307,
+      "reasoning_len": 0,
+      "reasoning_text": "",
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 4199,
+        "completion_tokens": 256,
+        "total_tokens": 4455,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "engine_prompt_tokens": 4199,
+      "reused_tokens": 0,
+      "new_prompt_tokens": 4199,
+      "read_ms": 5391,
+      "read_tok_s": 778.9,
+      "generated_tokens": 256,
+      "gen_ms": 2927,
+      "decode_tok_s": 87.5,
+      "pairing_ok": true,
+      "target": 4096,
+      "rep": 3,
+      "chars": 10535
+    },
+    {
+      "ok": true,
+      "payload_variant": 0,
+      "thinking_off": true,
+      "ttft_s": 35.841,
+      "total_s": 38.926,
+      "answer_len": 1302,
+      "reasoning_len": 0,
+      "reasoning_text": "",
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 33467,
+        "completion_tokens": 256,
+        "total_tokens": 33723,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "engine_prompt_tokens": 33467,
+      "reused_tokens": 0,
+      "new_prompt_tokens": 33467,
+      "read_ms": 35777,
+      "read_tok_s": 935.4,
+      "generated_tokens": 256,
+      "gen_ms": 3107,
+      "decode_tok_s": 82.4,
+      "pairing_ok": true,
+      "target": 32768,
+      "rep": 1,
+      "chars": 82757
+    },
+    {
+      "ok": true,
+      "payload_variant": 0,
+      "thinking_off": true,
+      "ttft_s": 35.987,
+      "total_s": 39.269,
+      "answer_len": 1366,
+      "reasoning_len": 0,
+      "reasoning_text": "",
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 33467,
+        "completion_tokens": 256,
+        "total_tokens": 33723,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "engine_prompt_tokens": 33467,
+      "reused_tokens": 0,
+      "new_prompt_tokens": 33467,
+      "read_ms": 35939,
+      "read_tok_s": 931.2,
+      "generated_tokens": 256,
+      "gen_ms": 3301,
+      "decode_tok_s": 77.5,
+      "pairing_ok": true,
+      "target": 32768,
+      "rep": 2,
+      "chars": 82757
+    },
+    {
+      "ok": true,
+      "payload_variant": 0,
+      "thinking_off": true,
+      "ttft_s": 35.933,
+      "total_s": 39.064,
+      "answer_len": 1328,
+      "reasoning_len": 0,
+      "reasoning_text": "",
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 33467,
+        "completion_tokens": 256,
+        "total_tokens": 33723,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "engine_prompt_tokens": 33467,
+      "reused_tokens": 0,
+      "new_prompt_tokens": 33467,
+      "read_ms": 35893,
+      "read_tok_s": 932.4,
+      "generated_tokens": 256,
+      "gen_ms": 3152,
+      "decode_tok_s": 81.2,
+      "pairing_ok": true,
+      "target": 32768,
+      "rep": 3,
+      "chars": 82757
+    }
+  ],
+  "needles": [],
+  "notes": [],
+  "calibration": {
+    "ok": true,
+    "payload_variant": 0,
+    "thinking_off": true,
+    "ttft_s": 5.114,
+    "total_s": 6.091,
+    "answer_len": 278,
+    "reasoning_len": 0,
+    "reasoning_text": "",
+    "finish_reason": "length",
+    "usage": {
+      "prompt_tokens": 3216,
+      "completion_tokens": 64,
+      "total_tokens": 3280,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "engine_prompt_tokens": 3216,
+    "reused_tokens": 0,
+    "new_prompt_tokens": 3216,
+    "read_ms": 5077,
+    "read_tok_s": 633.5,
+    "generated_tokens": 64,
+    "gen_ms": 1000,
+    "decode_tok_s": 64.0,
+    "pairing_ok": true
+  },
+  "chars_per_token": 2.5188916876574305,
+  "warmup": {
+    "ok": true,
+    "payload_variant": 0,
+    "thinking_off": true,
+    "ttft_s": 4.703,
+    "total_s": 5.109,
+    "answer_len": 151,
+    "reasoning_len": 0,
+    "reasoning_text": "",
+    "finish_reason": "length",
+    "usage": {
+      "prompt_tokens": 2082,
+      "completion_tokens": 32,
+      "total_tokens": 2114,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "engine_prompt_tokens": 2082,
+    "reused_tokens": 0,
+    "new_prompt_tokens": 2082,
+    "read_ms": 4659,
+    "read_tok_s": 446.9,
+    "generated_tokens": 32,
+    "gen_ms": 422,
+    "decode_tok_s": 75.8,
+    "pairing_ok": true
+  },
+  "finished": "2026-10-25 02:50:28",
+  "tag": "tailskip_off-r3"
+}

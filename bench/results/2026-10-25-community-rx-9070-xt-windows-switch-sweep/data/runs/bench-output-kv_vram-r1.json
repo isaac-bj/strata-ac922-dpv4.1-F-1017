@@ -1,0 +1,257 @@
+{
+  "started": "2026-10-25 01:43:46",
+  "url": "http://127.0.0.1:8091/v1/chat/completions",
+  "model": "qwen3.8-flash-next-iq3_xxs",
+  "engine_log": "<data>\\bench\\sweep-rx9070xt\\engine.log",
+  "cap_tokens": 256,
+  "reps": 3,
+  "speed": [
+    {
+      "ok": true,
+      "payload_variant": 0,
+      "thinking_off": true,
+      "ttft_s": 5.545,
+      "total_s": 8.02,
+      "answer_len": 1439,
+      "reasoning_len": 0,
+      "reasoning_text": "",
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 4195,
+        "completion_tokens": 256,
+        "total_tokens": 4451,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "engine_prompt_tokens": 4195,
+      "reused_tokens": 0,
+      "new_prompt_tokens": 4195,
+      "read_ms": 5507,
+      "read_tok_s": 761.7,
+      "generated_tokens": 256,
+      "gen_ms": 2489,
+      "decode_tok_s": 102.8,
+      "pairing_ok": true,
+      "target": 4096,
+      "rep": 1,
+      "chars": 10535
+    },
+    {
+      "ok": true,
+      "payload_variant": 0,
+      "thinking_off": true,
+      "ttft_s": 5.548,
+      "total_s": 8.64,
+      "answer_len": 1374,
+      "reasoning_len": 0,
+      "reasoning_text": "",
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 4198,
+        "completion_tokens": 256,
+        "total_tokens": 4454,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "engine_prompt_tokens": 4198,
+      "reused_tokens": 0,
+      "new_prompt_tokens": 4198,
+      "read_ms": 5505,
+      "read_tok_s": 762.6,
+      "generated_tokens": 256,
+      "gen_ms": 3107,
+      "decode_tok_s": 82.4,
+      "pairing_ok": true,
+      "target": 4096,
+      "rep": 2,
+      "chars": 10535
+    },
+    {
+      "ok": true,
+      "payload_variant": 0,
+      "thinking_off": true,
+      "ttft_s": 5.533,
+      "total_s": 8.657,
+      "answer_len": 1283,
+      "reasoning_len": 0,
+      "reasoning_text": "",
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 4199,
+        "completion_tokens": 254,
+        "total_tokens": 4453,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "engine_prompt_tokens": 4199,
+      "reused_tokens": 0,
+      "new_prompt_tokens": 4199,
+      "read_ms": 5511,
+      "read_tok_s": 761.9,
+      "generated_tokens": 254,
+      "gen_ms": 3141,
+      "decode_tok_s": 80.9,
+      "pairing_ok": true,
+      "target": 4096,
+      "rep": 3,
+      "chars": 10535
+    },
+    {
+      "ok": true,
+      "payload_variant": 0,
+      "thinking_off": true,
+      "ttft_s": 36.501,
+      "total_s": 39.752,
+      "answer_len": 1124,
+      "reasoning_len": 0,
+      "reasoning_text": "",
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 33467,
+        "completion_tokens": 256,
+        "total_tokens": 33723,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "engine_prompt_tokens": 33467,
+      "reused_tokens": 0,
+      "new_prompt_tokens": 33467,
+      "read_ms": 36466,
+      "read_tok_s": 917.8,
+      "generated_tokens": 256,
+      "gen_ms": 3268,
+      "decode_tok_s": 78.3,
+      "pairing_ok": true,
+      "target": 32768,
+      "rep": 1,
+      "chars": 82757
+    },
+    {
+      "ok": true,
+      "payload_variant": 0,
+      "thinking_off": true,
+      "ttft_s": 36.56,
+      "total_s": 39.836,
+      "answer_len": 1254,
+      "reasoning_len": 0,
+      "reasoning_text": "",
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 33467,
+        "completion_tokens": 256,
+        "total_tokens": 33723,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "engine_prompt_tokens": 33467,
+      "reused_tokens": 0,
+      "new_prompt_tokens": 33467,
+      "read_ms": 36506,
+      "read_tok_s": 916.8,
+      "generated_tokens": 256,
+      "gen_ms": 3294,
+      "decode_tok_s": 77.7,
+      "pairing_ok": true,
+      "target": 32768,
+      "rep": 2,
+      "chars": 82757
+    },
+    {
+      "ok": true,
+      "payload_variant": 0,
+      "thinking_off": true,
+      "ttft_s": 36.686,
+      "total_s": 39.766,
+      "answer_len": 919,
+      "reasoning_len": 0,
+      "reasoning_text": "",
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 33467,
+        "completion_tokens": 256,
+        "total_tokens": 33723,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "engine_prompt_tokens": 33467,
+      "reused_tokens": 0,
+      "new_prompt_tokens": 33467,
+      "read_ms": 36649,
+      "read_tok_s": 913.2,
+      "generated_tokens": 256,
+      "gen_ms": 3099,
+      "decode_tok_s": 82.6,
+      "pairing_ok": true,
+      "target": 32768,
+      "rep": 3,
+      "chars": 82757
+    }
+  ],
+  "needles": [],
+  "notes": [],
+  "calibration": {
+    "ok": true,
+    "payload_variant": 0,
+    "thinking_off": true,
+    "ttft_s": 5.231,
+    "total_s": 6.179,
+    "answer_len": 256,
+    "reasoning_len": 0,
+    "reasoning_text": "",
+    "finish_reason": "length",
+    "usage": {
+      "prompt_tokens": 3216,
+      "completion_tokens": 64,
+      "total_tokens": 3280,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "engine_prompt_tokens": 3216,
+    "reused_tokens": 0,
+    "new_prompt_tokens": 3216,
+    "read_ms": 5191,
+    "read_tok_s": 619.5,
+    "generated_tokens": 64,
+    "gen_ms": 969,
+    "decode_tok_s": 66.0,
+    "pairing_ok": true
+  },
+  "chars_per_token": 2.5188916876574305,
+  "warmup": {
+    "ok": true,
+    "payload_variant": 0,
+    "thinking_off": true,
+    "ttft_s": 4.872,
+    "total_s": 5.311,
+    "answer_len": 131,
+    "reasoning_len": 0,
+    "reasoning_text": "",
+    "finish_reason": "length",
+    "usage": {
+      "prompt_tokens": 2082,
+      "completion_tokens": 32,
+      "total_tokens": 2114,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "engine_prompt_tokens": 2082,
+    "reused_tokens": 0,
+    "new_prompt_tokens": 2082,
+    "read_ms": 4834,
+    "read_tok_s": 430.7,
+    "generated_tokens": 32,
+    "gen_ms": 454,
+    "decode_tok_s": 70.5,
+    "pairing_ok": true
+  },
+  "finished": "2026-10-25 01:46:22",
+  "tag": "kv_vram-r1"
+}

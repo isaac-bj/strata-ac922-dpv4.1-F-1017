@@ -1,0 +1,39 @@
+{
+ "exe": "<strata>\\engine\\strata.exe",
+ "args": [
+  "--pack",
+  "<data>\\packs\\iq3_xxs",
+  "--native",
+  "<data>\\models\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "--ple-gguf",
+  "<data>\\models\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+  "--expert-profile",
+  "<strata>\\data\\expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto",
+  "--spec",
+  "4",
+  "--spec-min-p",
+  "0.5",
+  "--mtp",
+  "<data>\\mtp\\rt",
+  "--max-context",
+  "131072",
+  "--kv",
+  "int8"
+ ],
+ "cwd": "<strata>",
+ "tokenizer": "<data>\\packs\\iq3_xxs\\tokenizer",
+ "model_name": "qwen3.8-flash-next-iq3_xxs",
+ "log": "<data>\\bench\\sweep-rx9070xt\\engine.log",
+ "lib_dirs": [
+  "<strata>\\engine\\rocm\\bin"
+ ],
+ "port": 8091,
+ "backend": "hip",
+ "env": {
+  "STRATA_HIPBLASLT_TUNING": "<strata>\\engine\\tuning\\gfx1201-hipblaslt-100500.txt"
+ }
+}

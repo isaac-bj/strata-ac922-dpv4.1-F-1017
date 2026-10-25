@@ -1,0 +1,386 @@
+[
+ {
+  "tag": "picture-cpu",
+  "kind": "picture",
+  "arm": "cpu",
+  "round": null,
+  "session": "S1",
+  "started": "2026-10-25T03:31:57",
+  "finished": "2026-10-25T03:33:04",
+  "ok": true,
+  "error": null,
+  "config": "run-sweep-vision-cpu.json",
+  "config_note": "base with --vision, the CPU picture reader (setup's choice under 24 GB of VRAM)",
+  "switches": {},
+  "ready_s": 20.2,
+  "background": {
+   "other_programs_vram_mib": 2686,
+   "ram_free_gib": 53.8,
+   "cpu_percent_5s": 2.2,
+   "pagefile_used_gib": 0.5
+  },
+  "engine": {
+   "slots": 3778,
+   "cache_gib": 6.16,
+   "chunk": 6144,
+   "ring": 384,
+   "vram_free_mib": 2093,
+   "switch_lines": [
+    "strata-vision: model files loaded in 1.3 s",
+    "strata-vision: on the CPU, 8 threads, no warm-up",
+    "[strata] 2026-10-25 03:32:11 engine started: <strata>\\engine\\strata.exe --serve --pack <data>\\packs\\iq3_xxs --native <data>\\models\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --ple-gguf <data>\\models\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf --expert-profile <strata>\\data\\expert-profile.bin --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp <data>\\mtp\\rt --max-context 131072 --kv int8 --kv-resident 32768 --vision",
+    "strata: gfx12 (RDNA4): 5 exact speed switches on by default (STRATA_GFX12_DEFAULTS=0 turns them off; a switch you set is kept): GDN_HEAD GDN_PP GDN_CONVL2 GDN_NOY CVEC_FUSE",
+    "strata: gfx12 (RDNA4): the hyper-connection projections are read as Q8_0 (quantized at load, decode faster, answers differ slightly); STRATA_HC_Q8=0 keeps the bf16 read",
+    "strata: STRATA_HC_Q8=1: 0.62 GiB of Q8_0 hyper-connection projections for the verify read",
+    "strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)",
+    "prefill gemm: hipBLASLt tuning enabled (32 rows, gfx1201, version 100500)",
+    "strata prefill: warmed the BF16 and FP16 GEMM libraries on GPU 0 in 705 ms (STRATA_PREFILL_WARM=0 skips)",
+    "strata generate: expert arena: cudaHostRegister PORTABLE ok; large pages refused for 42916118528 B (GetLargePageMinimum=2097152, VirtualAlloc error 1314); using 4 KB pages",
+    "strata: Windows budgets 15419 of this card's 16304 MiB for this process; free VRAM is counted within that (STRATA_WDDM_BUDGET=0: off)",
+    "strata: the prompt attention on matrix cores is off by default on Windows (opt-in until tested on Windows); STRATA_HIP_WMMA=1 turns it on (gfx1201)",
+    "strata generate: expert cache 3778 slots, 6.16 GiB of VRAM; policy is",
+    "prefill gemm: hipBLASLt tuning enabled (32 rows, gfx1201, version 100500)",
+    "strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)",
+    "strata serve: STRATA_ROUTE_TAIL_SKIP=7 is ON (default): a missed expert that every token of a verify window routes at rank 7 or lower is skipped (+10..20% decode on 12-16 GB cards that miss experts, answers differ slightly from 0.1.41); STRATA_ROUTE_TAIL_SKIP=0 turns it off",
+    "strata serve: adaptive overlap: off (STRATA_ADAPT_OVERLAP=1 turns it on)",
+    "strata serve: 2093 MiB of VRAM free with everything loaded",
+    "strata verify: captured the 6-token window (upload no error, sync no error)",
+    "strata verify: captured the 1-token window (upload no error, sync no error)",
+    "strata verify: captured the 4-token window (upload no error, sync no error)",
+    "strata verify: captured the 2-token window (upload no error, sync no error)",
+    "strata verify: captured the 3-token window (upload no error, sync no error)"
+   ]
+  },
+  "answers": [
+   {
+    "picture": "shapes.png",
+    "question": "What text is written in the image? Answer with the text only.",
+    "answer": " STRATA 42",
+    "expected": [
+     [
+      "strata"
+     ],
+     [
+      "42"
+     ]
+    ],
+    "correct": true,
+    "s": 5.39,
+    "finish": "stop",
+    "usage": {
+     "prompt_tokens": 288,
+     "completion_tokens": 6,
+     "total_tokens": 294,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    }
+   },
+   {
+    "picture": "shapes.png",
+    "question": "List every shape in the image with its colour, from left to right. One short line each.",
+    "answer": " Red circle\nBlue square\nGreen triangle",
+    "expected": [
+     [
+      "red"
+     ],
+     [
+      "circle"
+     ],
+     [
+      "blue"
+     ],
+     [
+      "square"
+     ],
+     [
+      "green"
+     ],
+     [
+      "triangle"
+     ]
+    ],
+    "correct": true,
+    "s": 2.69,
+    "finish": "stop",
+    "usage": {
+     "prompt_tokens": 294,
+     "completion_tokens": 9,
+     "total_tokens": 303,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    }
+   },
+   {
+    "picture": "code4217.png",
+    "question": "What text is written in the image? Answer with the text only.",
+    "answer": " CODE 4217",
+    "expected": [
+     [
+      "4217"
+     ]
+    ],
+    "correct": true,
+    "s": 5.48,
+    "finish": "stop",
+    "usage": {
+     "prompt_tokens": 304,
+     "completion_tokens": 7,
+     "total_tokens": 311,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    }
+   },
+   {
+    "picture": "code4217.png",
+    "question": "Describe the shapes in the image with their colours and positions, one short line each.",
+    "answer": "Red square on the left side of the image.\nBlue circle on the right side of the image.",
+    "expected": [
+     [
+      "red"
+     ],
+     [
+      "blue"
+     ],
+     [
+      "square"
+     ],
+     [
+      "circle"
+     ]
+    ],
+    "correct": true,
+    "s": 2.75,
+    "finish": "stop",
+    "usage": {
+     "prompt_tokens": 307,
+     "completion_tokens": 22,
+     "total_tokens": 329,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    }
+   },
+   {
+    "picture": null,
+    "question": "17 * 23",
+    "answer": "391",
+    "expected": [
+     [
+      "391"
+     ]
+    ],
+    "correct": true,
+    "s": 0.3,
+    "finish": "stop",
+    "usage": {
+     "prompt_tokens": 28,
+     "completion_tokens": 4,
+     "total_tokens": 32,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    }
+   }
+  ],
+  "correct": 5,
+  "asked": 5,
+  "server_vision_lines": [
+   "loading the vision encoder ..."
+  ]
+ },
+ {
+  "tag": "picture-gpu",
+  "kind": "picture",
+  "arm": "gpu",
+  "round": null,
+  "session": "S1",
+  "started": "2026-10-25T03:33:04",
+  "finished": "2026-10-25T03:34:06",
+  "ok": true,
+  "error": null,
+  "config": "run-sweep-vision-gpu.json",
+  "config_note": "base with --vision, the GPU picture reader strata-vision-hip (setup's choice from 24 GB)",
+  "switches": {},
+  "ready_s": 20.2,
+  "background": {
+   "other_programs_vram_mib": 2686,
+   "ram_free_gib": 53.8,
+   "cpu_percent_5s": 2.0,
+   "pagefile_used_gib": 0.5
+  },
+  "engine": {
+   "slots": 2959,
+   "cache_gib": 4.84,
+   "chunk": 6144,
+   "ring": 384,
+   "vram_free_mib": 2048,
+   "switch_lines": [
+    "strata-vision: model files loaded in 1.1 s",
+    "strata-vision: warmed up at 1024 image tokens in 1.1 s",
+    "[strata] 2026-10-25 03:33:19 engine started: <strata>\\engine\\strata.exe --serve --pack <data>\\packs\\iq3_xxs --native <data>\\models\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --ple-gguf <data>\\models\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf --expert-profile <strata>\\data\\expert-profile.bin --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp <data>\\mtp\\rt --max-context 131072 --kv int8 --kv-resident 32768 --vision",
+    "strata: gfx12 (RDNA4): 5 exact speed switches on by default (STRATA_GFX12_DEFAULTS=0 turns them off; a switch you set is kept): GDN_HEAD GDN_PP GDN_CONVL2 GDN_NOY CVEC_FUSE",
+    "strata: gfx12 (RDNA4): the hyper-connection projections are read as Q8_0 (quantized at load, decode faster, answers differ slightly); STRATA_HC_Q8=0 keeps the bf16 read",
+    "strata: STRATA_HC_Q8=1: 0.62 GiB of Q8_0 hyper-connection projections for the verify read",
+    "strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)",
+    "prefill gemm: hipBLASLt tuning enabled (32 rows, gfx1201, version 100500)",
+    "strata prefill: warmed the BF16 and FP16 GEMM libraries on GPU 0 in 705 ms (STRATA_PREFILL_WARM=0 skips)",
+    "strata generate: expert arena: cudaHostRegister PORTABLE ok; large pages refused for 42916118528 B (GetLargePageMinimum=2097152, VirtualAlloc error 1314); using 4 KB pages",
+    "strata: Windows budgets 15419 of this card's 16304 MiB for this process; free VRAM is counted within that (STRATA_WDDM_BUDGET=0: off)",
+    "strata: the prompt attention on matrix cores is off by default on Windows (opt-in until tested on Windows); STRATA_HIP_WMMA=1 turns it on (gfx1201)",
+    "strata generate: expert cache 2959 slots, 4.84 GiB of VRAM; policy is",
+    "prefill gemm: hipBLASLt tuning enabled (32 rows, gfx1201, version 100500)",
+    "strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)",
+    "strata serve: STRATA_ROUTE_TAIL_SKIP=7 is ON (default): a missed expert that every token of a verify window routes at rank 7 or lower is skipped (+10..20% decode on 12-16 GB cards that miss experts, answers differ slightly from 0.1.41); STRATA_ROUTE_TAIL_SKIP=0 turns it off",
+    "strata serve: adaptive overlap: off (STRATA_ADAPT_OVERLAP=1 turns it on)",
+    "strata serve: 2048 MiB of VRAM free with everything loaded",
+    "strata verify: captured the 6-token window (upload no error, sync no error)",
+    "strata verify: captured the 1-token window (upload no error, sync no error)",
+    "strata verify: captured the 4-token window (upload no error, sync no error)",
+    "strata verify: captured the 2-token window (upload no error, sync no error)",
+    "strata verify: captured the 3-token window (upload no error, sync no error)"
+   ]
+  },
+  "answers": [
+   {
+    "picture": "shapes.png",
+    "question": "What text is written in the image? Answer with the text only.",
+    "answer": " STRATA 42",
+    "expected": [
+     [
+      "strata"
+     ],
+     [
+      "42"
+     ]
+    ],
+    "correct": true,
+    "s": 2.78,
+    "finish": "stop",
+    "usage": {
+     "prompt_tokens": 288,
+     "completion_tokens": 6,
+     "total_tokens": 294,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    }
+   },
+   {
+    "picture": "shapes.png",
+    "question": "List every shape in the image with its colour, from left to right. One short line each.",
+    "answer": " Red circle\nBlue square\nGreen triangle",
+    "expected": [
+     [
+      "red"
+     ],
+     [
+      "circle"
+     ],
+     [
+      "blue"
+     ],
+     [
+      "square"
+     ],
+     [
+      "green"
+     ],
+     [
+      "triangle"
+     ]
+    ],
+    "correct": true,
+    "s": 2.75,
+    "finish": "stop",
+    "usage": {
+     "prompt_tokens": 294,
+     "completion_tokens": 9,
+     "total_tokens": 303,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    }
+   },
+   {
+    "picture": "code4217.png",
+    "question": "What text is written in the image? Answer with the text only.",
+    "answer": "CODE 4217",
+    "expected": [
+     [
+      "4217"
+     ]
+    ],
+    "correct": true,
+    "s": 3.04,
+    "finish": "stop",
+    "usage": {
+     "prompt_tokens": 378,
+     "completion_tokens": 7,
+     "total_tokens": 385,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    }
+   },
+   {
+    "picture": "code4217.png",
+    "question": "Describe the shapes in the image with their colours and positions, one short line each.",
+    "answer": "Based on the image provided, here is a description of the shapes:\n\n- A red square is located on the left side.\n- A blue circle is located on the right side.",
+    "expected": [
+     [
+      "red"
+     ],
+     [
+      "blue"
+     ],
+     [
+      "square"
+     ],
+     [
+      "circle"
+     ]
+    ],
+    "correct": true,
+    "s": 3.39,
+    "finish": "stop",
+    "usage": {
+     "prompt_tokens": 381,
+     "completion_tokens": 39,
+     "total_tokens": 420,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    }
+   },
+   {
+    "picture": null,
+    "question": "17 * 23",
+    "answer": "391",
+    "expected": [
+     [
+      "391"
+     ]
+    ],
+    "correct": true,
+    "s": 0.31,
+    "finish": "stop",
+    "usage": {
+     "prompt_tokens": 28,
+     "completion_tokens": 4,
+     "total_tokens": 32,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    }
+   }
+  ],
+  "correct": 5,
+  "asked": 5,
+  "server_vision_lines": [
+   "loading the vision encoder ..."
+  ]
+ }
+]
