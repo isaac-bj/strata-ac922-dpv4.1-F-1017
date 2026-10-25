@@ -936,6 +936,14 @@ print(r.choices[0].message.content)
   a 400. A token whose probability could not be read gets no entry, and the reply goes on. On a server started with
   `--parallel`, a request that asks for logprobs gets a 400: the engine's batched loop writes no LP lines, so there is
   nothing to report.
+- **logprobs on `/v1/completions` (vLLM's shape).** `"logprobs": N` (0..20, or `true` with `top_logprobs`) adds
+  `choices[0].logprobs` with `tokens`, `token_logprobs`, `top_logprobs` (one `{token: logprob}` per token) and
+  `text_offset`, not streamed. Every generated token is listed, the stop token too, so a one-token read whose most
+  likely token is the stop still has its distribution. `"allowed_token_ids"` lists those ids with their
+  full-vocabulary logprobs, not renormalised (unlike chat), so a caller can tell how much of the mass its labels hold;
+  `"return_tokens_as_token_ids": true` keys every token as `token_id:<id>`. The prompt may also be a list of token
+  ids. This is what a decision client reads from `vllm serve`: a typed choice from one next-token distribution
+  (AnyJev's `StrataBackend`). The limits are the chat ones: `max_tokens` 1 to 4,096 and no `--parallel`.
 - **A reply that ends inside its thinking (#1053, opt-in).** Some turns write a sentence of reasoning and then the
   end-of-turn token with no `</think>`: the content is empty and an agent stops. `"reasoning_close_retry": true` in
   `strata-<model>.json` closes the thinking once (as the thinking budget does) and continues, once per request, only for
