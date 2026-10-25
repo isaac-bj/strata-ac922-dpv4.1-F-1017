@@ -93,9 +93,11 @@ already on the disk, `strata launch` writes the run settings itself and says so;
 `strata models list` looks in the same places the screens and `strata launch` look (one function, `strata_control/discovery.py`): the folder you name with `--install-dir` or
 STRATA_INSTALL_DIR (then only that one), the Terminal's own folder, the folders earlier installs remembered in settings.json, and the desktop app's install folder, which the Terminal
 shares (Windows `%LOCALAPPDATA%\Strata\install`; Linux and macOS `$XDG_DATA_HOME/strata/install`, by default `~/.local/share/strata/install`). The data folder is the one you set, else the
-app's (`app-settings.json` beside its install folder, else a `Documents/Strata` that holds models), else Strata's default. `strata models import PATH --plan` knows the Gyro-S and Gyro-M files
-(TQK6/TQK7 and TQ2_T experts) and every file set setup installs, also under another name when the header matches, and says which run config, prepared pack, draft layer and picture reader
-already exist for them. Nothing is copied or moved.
+app's (`app-settings.json` beside its install folder, else a `Documents/Strata` that holds models), else Strata's default. `strata models import PATH --plan` knows the Gyro-S and Gyro-M files (TQK6/TQK7 and TQ2_T experts) and agentionai's
+Signal files (AP-Q4_K_XL's Q4_K and AP-IQ4_XS's IQ3_S experts, whose run config also wants the BF16 embedding copy
+beside the pack, which it reports as missing when it is not there), and every file set setup installs, also under
+another name when the header matches, and says which run config, prepared pack, draft layer and picture reader already
+exist for them. Nothing is copied or moved.
 
 ## When there is no engine for this computer
 

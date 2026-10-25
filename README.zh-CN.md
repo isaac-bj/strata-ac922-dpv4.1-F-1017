@@ -158,7 +158,8 @@ Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow doc
 | **96 GB 及以上** | Unsloth 的 **UD-IQ4_XS** 到 **Q8_0** | 最接近完整模型 |
 
 内存比这一行写的少，也可能能用，只是更慢：Strata 会自动切换到[低内存模式](docs/MODELS.md#a-big-graphics-card-and-little-ram)。
-另外还有：给 NVIDIA 显卡用的 [NVFP4](docs/NVFP4.md)、[Qwen3.6-35B-A3B](docs/QWEN36.md)（更小，能同时处理多个请求），
+另外还有：给 NVIDIA 显卡用的 [NVFP4](docs/NVFP4.md)、
+agentionai 的 [Signal](docs/MODELS.md#signal-3-8-flash-next)（微调后想得更少，用 `--family signal`），[Qwen3.6-35B-A3B](docs/QWEN36.md)（更小，能同时处理多个请求），
 以及 [OrcaRouter 的 Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)。所有尺寸，以及各种配置能跑什么：
 [docs/MODELS.md](docs/MODELS.md)。
 
