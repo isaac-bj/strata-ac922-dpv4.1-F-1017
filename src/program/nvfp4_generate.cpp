@@ -489,6 +489,7 @@ int run_nvfp4(int argc, char** argv) {
                     }
 
                     if (!draft.empty()) {
+                        auto t_ver0 = std::chrono::steady_clock::now();
                         const int32_t K = static_cast<int32_t>(draft.size());
                         const int32_t M = 1 + K;
                         spec_drafted_total += K;
@@ -512,6 +513,10 @@ int run_nvfp4(int argc, char** argv) {
                         spec_accepted_total += accepted;
                         const int32_t n_adv = 1 + accepted;
                         engine.finish_verify_step(M, n_adv);
+                        double ver_ms = std::chrono::duration<double, std::milli>(
+                                            std::chrono::steady_clock::now() - t_ver0)
+                                            .count();
+                        drafter.observe_step(K, accepted, ver_ms);
 
                         if (accepted < K) {
                             int32_t prev_t = b_toks[accepted];
@@ -535,12 +540,17 @@ int run_nvfp4(int argc, char** argv) {
                         if (hit_eos) break;
                         next_tok = preds[accepted];
                     } else {
+                        auto t_st0 = std::chrono::steady_clock::now();
                         int32_t prev0 = (history.size() >= 2) ? history[history.size() - 2] : strata::kernels::TOKEN_NULL;
                         int32_t prev1 = (history.size() >= 1) ? history[history.size() - 1] : strata::kernels::TOKEN_NULL;
                         int32_t pos = static_cast<int32_t>(history.size());
                         history.push_back(next_tok);
                         next_tok = engine.step_token(history.back(), prev0, prev1, pos, true, nullptr,
                                                      &req_sp, &history, &req_rng);
+                        double st_ms = std::chrono::duration<double, std::milli>(
+                                           std::chrono::steady_clock::now() - t_st0)
+                                           .count();
+                        drafter.observe_step(0, 0, st_ms);
                     }
                 }
                 double decode_ms = std::chrono::duration<double, std::milli>(
@@ -632,6 +642,7 @@ int run_nvfp4(int argc, char** argv) {
         }
 
         if (!draft.empty()) {
+            auto t_ver0 = std::chrono::steady_clock::now();
             const int32_t K = static_cast<int32_t>(draft.size());
             const int32_t M = 1 + K;
             spec_drafted_total += K;
@@ -655,6 +666,10 @@ int run_nvfp4(int argc, char** argv) {
             spec_accepted_total += accepted;
             const int32_t n_adv = 1 + accepted;
             engine.finish_verify_step(M, n_adv);
+            double ver_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_ver0)
+                                .count();
+            drafter.observe_step(K, accepted, ver_ms);
 
             if (accepted < K) {
                 // Record rejected transition so it is never re-drafted in this context
@@ -673,12 +688,17 @@ int run_nvfp4(int argc, char** argv) {
             }
             next_tok = preds[accepted];
         } else {
+            auto t_st0 = std::chrono::steady_clock::now();
             int32_t prev0 = (history.size() >= 2) ? history[history.size() - 2] : strata::kernels::TOKEN_NULL;
             int32_t prev1 = (history.size() >= 1) ? history[history.size() - 1] : strata::kernels::TOKEN_NULL;
             int32_t pos = static_cast<int32_t>(history.size());
             history.push_back(next_tok);
             next_tok = engine.step_token(history.back(), prev0, prev1, pos, true, nullptr,
                                          &cli_sp, &history, &cli_rng);
+            double st_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - t_st0)
+                               .count();
+            drafter.observe_step(0, 0, st_ms);
         }
     }
     double decode_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_decode_start).count();

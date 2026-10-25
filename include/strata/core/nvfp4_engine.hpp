@@ -150,7 +150,8 @@ private:
                                       const std::vector<int32_t>* history,
                                       std::mt19937_64& rng);
     int32_t run_cpu_moe_layer(int l, int32_t M, bool is_prefill);
-    void adapt_vram_experts(const int32_t* routed_ids, int32_t M, uint32_t min_hits, int max_swaps);
+    void adapt_vram_experts(const int32_t* routed_ids, int32_t M, uint32_t min_hits, int max_swaps,
+                            int32_t valid_toks = -1);
     void* gpu_alloc(size_t bytes, bool zero = false);
     void* host_pinned_alloc(size_t bytes);
     void alloc_state_and_scratch();
@@ -285,6 +286,7 @@ private:
     void* d_recurrent_ckpt_ = nullptr;
     void* h_turn_ckpt_ = nullptr;
     size_t recurrent_arena_bytes_ = 0;
+    size_t recurrent_ckpt_bytes_ = 0;
     void* init_gdn_conv_in_[48]{};
     void* init_gdn_conv_out_[48]{};
     void* ckpt_gdn_conv_in_[48]{};

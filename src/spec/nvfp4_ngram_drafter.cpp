@@ -1,7 +1,15 @@
-// src/spec/nvfp4_ngram_drafter.cpp - Multi-level consensus suffix drafter with rejection memory.
+// src/spec/nvfp4_ngram_drafter.cpp - DSpark confidence-scheduled suffix drafter with hardware-aware prefix scheduling.
+//
+// Adapts the Calibrated Confidence Estimator (Section 3.3.1, Eq. 11-13) and
+// Hardware-Aware Prefix Length Scheduler (Section 3.3.2, Algorithm 1) from:
+//   - DeepSeek-AI, "DSpark: Confidence-Scheduled Speculative Decoding with
+//     Semi-Autoregressive Generation" (arXiv:2607.05147, CC BY 4.0)
+//   - deepseek-ai/DeepSpec (MIT License, Copyright (c) 2026 DeepSeek)
 #include "strata/spec/nvfp4_ngram_drafter.hpp"
 
+#include <algorithm>
 #include <cctype>
+#include <cmath>
 
 namespace strata::spec {
 
@@ -10,6 +18,7 @@ Nvfp4NgramDrafter::Nvfp4NgramDrafter(const strata::artifact::QwenTokenizer& toke
 
 void Nvfp4NgramDrafter::clear_rejections() {
     rejected_set_.clear();
+    last_draft_len_ = 0;
 }
 
 uint64_t Nvfp4NgramDrafter::make_rej_key(int32_t p2, int32_t p1, int32_t cand) {
@@ -25,7 +34,7 @@ void Nvfp4NgramDrafter::record_rejection(int32_t prev2_t, int32_t prev_t, int32_
 
 bool Nvfp4NgramDrafter::is_rejected(int32_t p2, int32_t p1, int32_t cand) const {
     if (rejected_set_.find(make_rej_key(p2, p1, cand)) != rejected_set_.end()) return true;
-    if (p2 == -1 && rejected_set_.find(make_rej_key(-1, p1, cand)) != rejected_set_.end()) return true;
+    if (rejected_set_.find(make_rej_key(-1, p1, cand)) != rejected_set_.end()) return true;
     return false;
 }
 
@@ -40,7 +49,14 @@ bool Nvfp4NgramDrafter::is_clause_break(int32_t cand_id, int32_t next_id) {
     const std::string& s = get_tok_str(cand_id);
     if (s.empty()) return true;
     char c0 = s[0];
-    if (c0 == '\n' || c0 == '\r' || c0 == ',' || c0 == ';' || c0 == ')' || c0 == ']' || c0 == '}') return true;
+    if (c0 == '\n' || c0 == '\r' || c0 == ',' || c0 == ';' || c0 == ':' ||
+        c0 == ')' || c0 == ']' || c0 == '}' || c0 == '(' || c0 == '[' || c0 == '"') {
+        return true;
+    }
+    if (c0 == ' ' && s.size() >= 2) {
+        char c1 = s[1];
+        if (c1 == '(' || c1 == '[' || c1 == '"' || c1 == '*') return true;
+    }
     if (c0 == '.') {
         if (s.size() == 1 && next_id >= 0 && next_id < 248040) {
             const std::string& ns = get_tok_str(next_id);
@@ -83,6 +99,16 @@ bool Nvfp4NgramDrafter::is_entity_or_num(int32_t id) {
     if (s.size() - pos < 2) return false;
     unsigned char c0 = static_cast<unsigned char>(s[pos]);
     if (std::isdigit(c0)) return true;
+    // Also detect mixed-case/numeric technical tokens like "gfx", "nvfp", "fp4", "x3d"
+    bool has_digit_or_inner_upper = false;
+    for (size_t k = pos + 1; k < s.size(); ++k) {
+        unsigned char ck = static_cast<unsigned char>(s[k]);
+        if (std::isdigit(ck) || std::isupper(ck)) {
+            has_digit_or_inner_upper = true;
+            break;
+        }
+    }
+    if (has_digit_or_inner_upper) return true;
     if (!std::isupper(c0)) return false;
     std::string w = s.substr(pos);
     static const char* const kCapStop[] = {
@@ -92,7 +118,8 @@ bool Nvfp4NgramDrafter::is_entity_or_num(int32_t id) {
         "How", "What", "Which", "Who", "Here", "There", "Each", "Both", "All", "Some",
         "No", "Not", "Only", "Also", "However", "Therefore", "Thus", "Summarize",
         "Explain", "Describe", "List", "Compare", "Key", "Summary", "Overview", "Note",
-        "Contains", "Equipped", "Uses", "Based", "Running", "Routes", "Total", "Step"
+        "Contains", "Equipped", "Uses", "Based", "Running", "Routes", "Total", "Step",
+        "Modern", "First", "Second", "Third", "Finally", "When", "Once", "After", "Before"
     };
     for (const char* sw : kCapStop) {
         if (w == sw) return false;
@@ -105,7 +132,7 @@ bool Nvfp4NgramDrafter::is_new_number_head(int32_t /*prev2_id*/, int32_t prev_id
     const std::string& ps = get_tok_str(prev_id);
     if (ps.empty()) return false;
     char pb = ps.back();
-    return (pb == '(' || pb == '*' || pb == '[');
+    return (pb == '(' || pb == '*' || pb == '[' || pb == '\n');
 }
 
 bool Nvfp4NgramDrafter::is_content_token(int32_t id) {
@@ -130,9 +157,143 @@ bool Nvfp4NgramDrafter::is_content_token(int32_t id) {
     return true;
 }
 
+void Nvfp4NgramDrafter::observe_step(int32_t drafted, int32_t accepted, double step_ms) {
+    if (step_ms >= 5.0 && step_ms <= 200.0) {
+        if (drafted == 0) {
+            ema_step_ms_[0] = 0.85 * ema_step_ms_[0] + 0.15 * step_ms;
+            for (size_t k = 1; k <= 3; ++k) {
+                const double min_ver = ema_step_ms_[0] * (1.42 + 0.06 * static_cast<double>(k));
+                if (ema_step_ms_[k] < min_ver) ema_step_ms_[k] = min_ver;
+            }
+        } else if (drafted >= 1 && drafted <= 3) {
+            if (accepted == drafted) {
+                // Full acceptance: zero GDN rollback occurred, direct measurement of T_verify(1 + drafted)
+                ema_step_ms_[static_cast<size_t>(drafted)] =
+                    0.80 * ema_step_ms_[static_cast<size_t>(drafted)] + 0.20 * step_ms;
+            } else {
+                // Partial/zero acceptance: step_ms includes GDN recurrent state restore + replay
+                double est_verify = std::max(ema_step_ms_[0] * 1.45, step_ms - ema_rollback_ms_);
+                ema_step_ms_[static_cast<size_t>(drafted)] =
+                    0.85 * ema_step_ms_[static_cast<size_t>(drafted)] + 0.15 * est_verify;
+            }
+        }
+    }
+
+    // DSpark causal prefix survival calibration (Eq. 11):
+    // Update empirical survival probability only for positions up to the first rejected draft token.
+    if (drafted >= 1 && drafted == last_draft_len_) {
+        const int32_t tested = std::min(drafted, accepted + 1);
+        for (int32_t j = 0; j < tested && j < 3; ++j) {
+            const int32_t b = std::clamp(last_draft_buckets_[static_cast<size_t>(j)], 0, 4);
+            const double survived = (j < accepted) ? 1.0 : 0.0;
+            bucket_emp_survival_[static_cast<size_t>(b)] =
+                0.92 * bucket_emp_survival_[static_cast<size_t>(b)] + 0.08 * survived;
+        }
+    }
+    last_draft_len_ = 0;
+}
+
+double Nvfp4NgramDrafter::estimate_step_confidence(const StepStats& st, int32_t prev2_id,
+                                                   int32_t prev_id, int32_t next_id) {
+    if (st.cand < 0 || st.total <= 0 || st.agree <= 0) return 0.0;
+
+    // DSpark distribution summary statistics (Section 3.3.1, Eq. 12):
+    // top-1 empirical probability pi_1, runner-up pi_2, and margin (pi_1 - pi_2).
+    const double pi_1 = static_cast<double>(st.agree) / static_cast<double>(st.total);
+    const double pi_2 = static_cast<double>(st.runner_up) / static_cast<double>(st.total);
+    const double margin = std::max(0.0, pi_1 - pi_2);
+
+    // Base survival prior indexed by effective Markov suffix order L_eff
+    double prior = 0.50;
+    if (st.match_order >= 5) {
+        prior = 0.94 + 0.02 * std::min(st.agree - 1, 2);
+    } else if (st.match_order == 4) {
+        prior = 0.88 + 0.04 * std::min(st.agree - 1, 2);
+    } else if (st.match_order == 3) {
+        prior = 0.75 + 0.07 * std::min(st.agree - 1, 2);
+    } else if (st.match_order == 2) {
+        prior = 0.64 + 0.10 * std::min(st.agree - 1, 2);
+    } else {
+        prior = 0.56 + 0.12 * std::min(st.agree - 1, 2);
+    }
+
+    // Blend prior with online calibrated bucket survival rate
+    const int32_t b = std::clamp(st.bucket, 0, 4);
+    double conf = 0.75 * prior + 0.25 * bucket_emp_survival_[static_cast<size_t>(b)];
+
+    // Modulate by empirical consensus and top-2 margin
+    conf *= pi_1 * (0.55 + 0.45 * margin);
+
+    // Lexical / structural features
+    if (is_subword_cont(prev_id, st.cand, next_id)) {
+        const std::string& cs = get_tok_str(st.cand);
+        if (!cs.empty() && std::isalnum(static_cast<unsigned char>(cs[0]))) {
+            conf += 0.10;
+        } else {
+            conf += 0.05;
+        }
+    } else if (is_entity_or_num(prev_id) && is_entity_or_num(st.cand)) {
+        conf += 0.08;
+    } else if (prev2_id >= 0 && is_content_token(prev_id) && is_content_token(st.cand)) {
+        conf += 0.05;
+    }
+
+    if (is_clause_break(st.cand, next_id) && st.match_order < 5) {
+        conf -= 0.20;
+    }
+    return std::clamp(conf, 0.0, 0.99);
+}
+
+int32_t Nvfp4NgramDrafter::schedule_prefix(const StepStats* steps, int32_t num_cand) const {
+    if (num_cand <= 0) return 0;
+
+    // DSpark Algorithm 1: Hardware-Aware Prefix Length Scheduler
+    // Baseline throughput without speculation (l = 0):
+    //   Theta(0) = 1.0 / T_verify(1)
+    // Speculative throughput for prefix length l in {1, ..., num_cand}:
+    //   a_l      = prod_{i=1}^l c_i
+    //   A(l)     = 1.0 + sum_{j=1}^l a_j
+    //   C(l)     = T_verify(1 + l) + (1.0 - a_l) * T_rollback
+    //   Theta(l) = A(l) / C(l)
+    const double t_base = std::max(5.0, ema_step_ms_[0]);
+    const double theta_0 = 1.0 / t_base;
+
+    // Require >= 15% expected speedup over single-token decode to justify batch verification
+    double best_theta = theta_0 * 1.15;
+    int32_t best_len = 0;
+
+    double a_l = 1.0;
+    double expected_adv = 1.0;
+    for (int32_t l = 1; l <= num_cand && l <= 3; ++l) {
+        const double c_l = steps[l - 1].confidence;
+        if (c_l <= 0.0) break;
+        a_l *= c_l;
+        expected_adv += a_l;
+
+        const double min_ver = t_base * (1.42 + 0.06 * static_cast<double>(l));
+        const double t_ver = std::max(min_ver, ema_step_ms_[static_cast<size_t>(l)]);
+        const double expected_cost = t_ver + (1.0 - a_l) * ema_rollback_ms_;
+        const double theta_l = expected_adv / expected_cost;
+
+        if (theta_l > best_theta) {
+            best_theta = theta_l * 1.015;  // Causal greedy margin for extending prefix
+            best_len = l;
+        } else {
+            // Because l=1 -> l=2 amortizes the fixed batch verification setup cost across 2 tokens,
+            // allow evaluating l=2 when l=1 has strong confidence (c_1 >= 0.58)
+            if (l == 1 && num_cand >= 2 && c_l >= 0.58) {
+                continue;
+            }
+            break;
+        }
+    }
+    return best_len;
+}
+
 void Nvfp4NgramDrafter::draft(int32_t cur_tok, size_t prompt_len, const std::vector<int32_t>& history,
                               bool enabled, std::vector<int32_t>& draft_out) {
     draft_out.clear();
+    last_draft_len_ = 0;
     if (!enabled || prompt_len < 8 || history.size() < 4) return;
     const size_t n = history.size();
     const int32_t w0 = history[n - 3];
@@ -140,33 +301,85 @@ void Nvfp4NgramDrafter::draft(int32_t cur_tok, size_t prompt_len, const std::vec
     const int32_t w2 = history[n - 1];
     const int32_t w3 = cur_tok;
 
-    // Multi-level consensus suffix matcher: L = 4, 3, 2, 1
+    // If cur_tok is inside a multi-digit number (Qwen tokenizes each digit 0..9 separately),
+    // require any history match to align with the full digit prefix from the start of the number
+    // (prevents e.g. "mid-20" from matching the middle two digits of "gfx1201").
+    size_t cur_digit_run = 0;
+    if (is_digit_tok(w3)) {
+        cur_digit_run = 1;
+        while (cur_digit_run <= n && is_digit_tok(history[n - cur_digit_run])) {
+            cur_digit_run++;
+        }
+    }
+
+    bool matched_higher_order = false;
+
+    // Multi-level Markov suffix matcher: L = 4 (with extension up to L = 32), 3, 2, 1
     for (int L = 4; L >= 1; --L) {
+        if (L == 1 && matched_higher_order) {
+            // Never fall through to an uncalibrated 1-gram if a >=2-gram suffix matched in history
+            break;
+        }
+
         int total1 = 0, total2 = 0, total3 = 0, total4 = 0;
         int agree1 = 0, agree2 = 0, agree3 = 0, agree4 = 0;
+        int runner1 = 0, runner2 = 0, runner3 = 0;
         int32_t c1 = -1, c2 = -1, c3 = -1, c4 = -1;
-        const size_t min_i = static_cast<size_t>(L - 1);
+        int32_t best_match_L = L;
+
+        const size_t min_i = std::max(static_cast<size_t>(L - 1), cur_digit_run);
+        if (n < 2 || (n - 2) < min_i) continue;
         for (size_t i = n - 2;; --i) {
             bool match = (history[i] == w3);
             if (match && L >= 2) match = (history[i - 1] == w2);
             if (match && L >= 3) match = (history[i - 2] == w1);
             if (match && L >= 4) match = (history[i - 3] == w0);
+            if (match && cur_digit_run > 0) {
+                for (size_t d = 1; d < cur_digit_run; ++d) {
+                    if (history[i - d] != history[n - d]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match && is_digit_tok(history[i - cur_digit_run])) {
+                    match = false;
+                }
+            }
             if (match && (i + 1) < n) {
                 int32_t cand1 = history[i + 1];
-                if (cand1 >= 0 && cand1 < 248040 && !is_rejected(w2, w3, cand1) &&
-                    !(L == 1 && is_rejected(-1, w3, cand1))) {
+                if (cand1 >= 0 && cand1 < 248040 && !is_rejected(w2, w3, cand1)) {
+                    int32_t cur_match_L = L;
+                    if (L == 4) {
+                        while (cur_match_L < 32 && i >= static_cast<size_t>(cur_match_L) &&
+                               n >= static_cast<size_t>(cur_match_L) &&
+                               history[i - static_cast<size_t>(cur_match_L)] ==
+                                   history[n - static_cast<size_t>(cur_match_L)]) {
+                            cur_match_L++;
+                        }
+                    }
+
                     total1++;
                     int32_t cand2 = ((i + 2) < n && history[i + 2] < 248040) ? history[i + 2] : -1;
                     int32_t cand3 = (cand2 >= 0 && (i + 3) < n && history[i + 3] < 248040) ? history[i + 3] : -1;
                     int32_t cand4 = (cand3 >= 0 && (i + 4) < n && history[i + 4] < 248040) ? history[i + 4] : -1;
-                    if (c1 < 0) {
+
+                    if (c1 < 0 || (L == 4 && cur_match_L > best_match_L && cand1 != c1)) {
+                        if (c1 >= 0 && cand1 != c1) {
+                            runner1 = std::max(runner1, agree1);
+                            agree1 = 0;
+                            total2 = agree2 = runner2 = 0;
+                            total3 = agree3 = runner3 = 0;
+                            total4 = agree4 = 0;
+                        }
                         c1 = cand1;
                         c2 = cand2;
                         c3 = cand3;
                         c4 = cand4;
+                        best_match_L = std::max(best_match_L, cur_match_L);
                     }
                     if (cand1 == c1) {
                         agree1++;
+                        best_match_L = std::max(best_match_L, cur_match_L);
                         if (cand2 >= 0) {
                             if (c2 < 0) c2 = cand2;
                             total2++;
@@ -182,10 +395,16 @@ void Nvfp4NgramDrafter::draft(int32_t cur_tok, size_t prompt_len, const std::vec
                                             total4++;
                                             if (cand4 == c4) agree4++;
                                         }
+                                    } else {
+                                        runner3++;
                                     }
                                 }
+                            } else {
+                                runner2++;
                             }
                         }
+                    } else {
+                        runner1++;
                     }
                 }
             }
@@ -193,90 +412,193 @@ void Nvfp4NgramDrafter::draft(int32_t cur_tok, size_t prompt_len, const std::vec
         }
         if (total1 == 0 || c1 < 0) continue;
 
+        if (L >= 3 || (L == 2 && total1 >= 2)) {
+            matched_higher_order = true;
+        }
+
+        // Subword-chain word-boundary normalization:
+        // If w3 completes a multi-token hyphenated/numeric word (e.g. "out-of-order" = 5 tokens)
+        // and c1 starts a new word (!is_subword_cont(w3, c1, c2)), count how many tokens belong
+        // to the single word ending at w3. If the entire suffix match (best_match_L) is just that
+        // single word (the word preceding it did not match), the inter-word Markov order is 1 word.
+        if (!is_subword_cont(w3, c1, c2) && is_subword_cont(w2, w3, c1)) {
+            int32_t tail_word_toks = 2;
+            while (tail_word_toks < best_match_L && n >= static_cast<size_t>(tail_word_toks)) {
+                int32_t p_tok = history[n - static_cast<size_t>(tail_word_toks)];
+                int32_t c_tok = history[n - static_cast<size_t>(tail_word_toks) + 1];
+                int32_t n_tok = (tail_word_toks == 2) ? w3 : history[n - static_cast<size_t>(tail_word_toks) + 2];
+                if (!is_subword_cont(p_tok, c_tok, n_tok)) break;
+                tail_word_toks++;
+            }
+            if (best_match_L <= tail_word_toks && agree1 < 2 &&
+                !(is_entity_or_num(w3) && is_entity_or_num(c1))) {
+                continue;
+            }
+        }
+
         auto space_ok = [&](int32_t ck, int32_t ck_next, int ag_next, int tot_next, int32_t prev_t) -> bool {
             if (get_tok_str(ck) != " ") return true;
             return (ck_next >= 0 && tot_next > 0 && ag_next == tot_next && !is_new_number_head(prev_t, ck, ck_next));
         };
 
+        StepStats steps[3]{};
+        int32_t num_cand = 0;
+        const int32_t base_bucket = (best_match_L >= 5) ? 4 : (L - 1);
+
         if (L == 4) {
-            if (is_new_number_head(w2, w3, c1) && agree1 < 2) continue;
-            draft_out.push_back(c1);
-            if (c2 >= 0 && !is_rejected(w3, c1, c2) && !is_new_number_head(w3, c1, c2)) {
-                draft_out.push_back(c2);
-                if (c3 >= 0 && !is_rejected(c1, c2, c3) && !is_new_number_head(c1, c2, c3)) {
-                    draft_out.push_back(c3);
+            if (is_new_number_head(w2, w3, c1) && agree1 < 2 && best_match_L < 5) continue;
+            if (is_clause_break(c1, c2) && agree1 < 2 && best_match_L < 6) continue;
+            if (agree1 <= runner1) continue;
+
+            steps[0] = {c1, agree1, total1, runner1, best_match_L, base_bucket, 0.0};
+            steps[0].confidence = estimate_step_confidence(steps[0], w2, w3, c2);
+            num_cand = 1;
+
+            if (c2 >= 0 && total2 > 0 && agree2 > runner2 && !is_rejected(w3, c1, c2) &&
+                !is_new_number_head(w3, c1, c2) &&
+                (!is_clause_break(c2, c3) || best_match_L >= 5 || agree2 >= 2)) {
+                steps[1] = {c2, agree2, total2, runner2, best_match_L + 1, std::min(4, base_bucket + 1), 0.0};
+                steps[1].confidence = estimate_step_confidence(steps[1], w3, c1, c3);
+                num_cand = 2;
+
+                if (c3 >= 0 && total3 > 0 && agree3 > runner3 && !is_rejected(c1, c2, c3) &&
+                    !is_new_number_head(c1, c2, c3) &&
+                    (!is_clause_break(c3, c4) || best_match_L >= 6 || agree3 >= 2)) {
+                    steps[2] = {c3, agree3, total3, runner3, best_match_L + 2, std::min(4, base_bucket + 1), 0.0};
+                    steps[2].confidence = estimate_step_confidence(steps[2], c1, c2, c4);
+                    num_cand = 3;
                 }
             }
-            if (draft_out.size() >= 2) return;
-            draft_out.clear();
-            continue;
-        }
-        if (L == 3) {
-            if (agree1 == total1 && !is_clause_break(c1, c2) && !is_new_number_head(w2, w3, c1) &&
-                space_ok(c1, c2, agree2, total2, w3)) {
-                draft_out.push_back(c1);
+        } else if (L == 3) {
+            int n_content3 = (is_content_token(w1) ? 1 : 0) + (is_content_token(w2) ? 1 : 0) +
+                             (is_content_token(w3) ? 1 : 0);
+            bool ok3 = (agree1 == total1) && !is_clause_break(c1, c2) && !is_new_number_head(w2, w3, c1) &&
+                       space_ok(c1, c2, agree2, total2, w3) &&
+                       (agree1 >= 2 || is_subword_cont(w3, c1, c2) || is_subword_cont(w2, w3, c1) ||
+                        is_content_token(c1) || n_content3 >= 2);
+            if (ok3) {
+                steps[0] = {c1, agree1, total1, runner1, 3, 2, 0.0};
+                steps[0].confidence = estimate_step_confidence(steps[0], w2, w3, c2);
+                num_cand = 1;
+
                 if (c2 >= 0 && total2 > 0 && agree2 == total2 && !is_rejected(w3, c1, c2) &&
                     !is_clause_break(c2, c3) && !is_new_number_head(w3, c1, c2) &&
                     space_ok(c2, c3, agree3, total3, c1)) {
-                    draft_out.push_back(c2);
+                    steps[1] = {c2, agree2, total2, runner2, 4, 3, 0.0};
+                    steps[1].confidence = estimate_step_confidence(steps[1], w3, c1, c3);
+                    num_cand = 2;
+
                     if (c3 >= 0 && total3 > 0 && agree3 == total3 && !is_rejected(c1, c2, c3) &&
                         !is_clause_break(c3, c4) && !is_new_number_head(c1, c2, c3) &&
                         space_ok(c3, c4, agree4, total4, c2)) {
-                        draft_out.push_back(c3);
+                        steps[2] = {c3, agree3, total3, runner3, 5, 4, 0.0};
+                        steps[2].confidence = estimate_step_confidence(steps[2], c1, c2, c4);
+                        num_cand = 3;
                     }
                 }
-                if (draft_out.size() >= 2) return;
-                draft_out.clear();
             }
-        }
-        if (L == 2) {
+        } else if (L == 2) {
             bool ok2 = (agree1 == total1) && !is_clause_break(c1, c2) && !is_new_number_head(w2, w3, c1) &&
                        space_ok(c1, c2, agree2, total2, w3) &&
                        (is_subword_cont(w3, c1, c2) || is_subword_cont(w2, w3, c1) || is_content_token(w3) ||
                         (is_content_token(w2) && is_content_token(c1)));
             if (ok2) {
-                draft_out.push_back(c1);
+                steps[0] = {c1, agree1, total1, runner1, 2, 1, 0.0};
+                steps[0].confidence = estimate_step_confidence(steps[0], w2, w3, c2);
+                num_cand = 1;
+
                 if (c2 >= 0 && total2 > 0 && agree2 == total2 && !is_rejected(w3, c1, c2) &&
                     !is_clause_break(c2, c3) && !is_new_number_head(w3, c1, c2) &&
                     space_ok(c2, c3, agree3, total3, c1) &&
                     (is_subword_cont(c1, c2, c3) || is_content_token(c2) || total1 >= 2)) {
-                    draft_out.push_back(c2);
+                    steps[1] = {c2, agree2, total2, runner2, 3, 2, 0.0};
+                    steps[1].confidence = estimate_step_confidence(steps[1], w3, c1, c3);
+                    num_cand = 2;
+
                     if (c3 >= 0 && total3 > 0 && agree3 == total3 && !is_rejected(c1, c2, c3) &&
                         !is_clause_break(c3, c4) && !is_new_number_head(c1, c2, c3) &&
-                        space_ok(c3, c4, agree3, total4, c2) &&
+                        space_ok(c3, c4, agree4, total4, c2) &&
                         (is_subword_cont(c2, c3, c4) || is_entity_or_num(c3) || total1 >= 2)) {
-                        draft_out.push_back(c3);
+                        steps[2] = {c3, agree3, total3, runner3, 4, 3, 0.0};
+                        steps[2].confidence = estimate_step_confidence(steps[2], c1, c2, c4);
+                        num_cand = 3;
                     }
                 }
-                if (draft_out.size() >= 2) return;
-                draft_out.clear();
             }
-        }
-        if (L == 1) {
+        } else if (L == 1) {
+            // Strict calibrated gating at L = 1 to prevent unigram false positives:
+            // Do not trigger on single-occurrence lowercase common words (e.g. " out" -> "-of")
+            // or short lowercase prefixes (e.g. " re", " mis").
             const std::string& w3_s = get_tok_str(w3);
+            const std::string& c1_s = get_tok_str(c1);
             size_t w3_pos = (!w3_s.empty() && w3_s[0] == ' ') ? 1 : 0;
-            bool w3_substantial = (w3_s.size() - w3_pos >= 2) || is_entity_or_num(w3);
-            bool sub1 = w3_substantial && is_subword_cont(w3, c1, c2);
-            bool ent1 = (total1 <= 6) && is_entity_or_num(w3) &&
-                        (is_entity_or_num(c1) || (get_tok_str(c1) == " " && space_ok(c1, c2, agree2, total2, w3)));
+            size_t w3_len = (w3_s.size() > w3_pos) ? (w3_s.size() - w3_pos) : 0;
+            bool w3_ent = is_entity_or_num(w3);
+            bool c1_alnum_head = !c1_s.empty() && std::isalnum(static_cast<unsigned char>(c1_s[0]));
+
+            // Subword continuation at L = 1 requires either:
+            // - an entity/numeric/mixed-case stem (e.g. "gfx" -> "1201", "GD" -> "DR"),
+            // - a digit continuation (e.g. "fp" -> "4"),
+            // - repeated consensus in history (agree1 >= 2 with >= 4-char stem and alphanumeric c1), or
+            // - a long specific word root (>= 6 chars) with alphanumeric c1 continuation.
+            bool sub1 = is_subword_cont(w3, c1, c2) &&
+                        (w3_ent || is_digit_tok(c1) ||
+                         (c1_alnum_head && ((agree1 >= 2 && w3_len >= 4) || w3_len >= 6)));
+
+            // Entity/number phrase continuation at L = 1 (e.g. "AMD" -> " Radeon", "R9700" -> " ("):
+            bool ent1 = (total1 <= 6) && w3_ent &&
+                        (is_entity_or_num(c1) || (c1_s == " " && space_ok(c1, c2, agree2, total2, w3)));
+
             if (agree1 == total1 && !is_clause_break(c1, c2) && !is_new_number_head(w2, w3, c1) &&
                 space_ok(c1, c2, agree2, total2, w3) && (sub1 || ent1)) {
-                draft_out.push_back(c1);
+                steps[0] = {c1, agree1, total1, runner1, 1, 0, 0.0};
+                steps[0].confidence = estimate_step_confidence(steps[0], w2, w3, c2);
+                num_cand = 1;
+
                 if (c2 >= 0 && total2 > 0 && agree2 == total2 && !is_rejected(w3, c1, c2) &&
                     !is_clause_break(c2, c3) && !is_new_number_head(w3, c1, c2) &&
                     space_ok(c2, c3, agree3, total3, c1) &&
                     (is_subword_cont(c1, c2, c3) || is_entity_or_num(c2) ||
-                     (get_tok_str(c1) == " " && is_digit_tok(c2)))) {
-                    draft_out.push_back(c2);
+                     (c1_s == " " && is_digit_tok(c2)))) {
+                    steps[1] = {c2, agree2, total2, runner2, 2, 1, 0.0};
+                    steps[1].confidence = estimate_step_confidence(steps[1], w3, c1, c3);
+                    num_cand = 2;
+
                     if (c3 >= 0 && total3 > 0 && agree3 == total3 && !is_rejected(c1, c2, c3) &&
                         !is_clause_break(c3, c4) && !is_new_number_head(c1, c2, c3) &&
                         space_ok(c3, c4, agree4, total4, c2) &&
                         (is_subword_cont(c2, c3, c4) || (is_digit_tok(c2) && is_digit_tok(c3)))) {
-                        draft_out.push_back(c3);
+                        steps[2] = {c3, agree3, total3, runner3, 3, 2, 0.0};
+                        steps[2].confidence = estimate_step_confidence(steps[2], c1, c2, c4);
+                        num_cand = 3;
                     }
                 }
-                if (draft_out.size() >= 2) return;
-                draft_out.clear();
+            }
+        }
+
+        if (num_cand > 0) {
+            int32_t sched_len = schedule_prefix(steps, num_cand);
+            // Never end a draft on a bare space token " "
+            while (sched_len > 0 && get_tok_str(steps[sched_len - 1].cand) == " ") {
+                sched_len--;
+            }
+            // At L = 1 with only a single occurrence in history (agree1 == 1), require either
+            // a 2-token verified entity/subword continuation or an intra-word alphanumeric subword
+            if (L == 1 && agree1 == 1 && sched_len == 1) {
+                const std::string& c1_s = get_tok_str(steps[0].cand);
+                bool strong_subword = is_subword_cont(w3, steps[0].cand, c2) &&
+                                      !c1_s.empty() && std::isalnum(static_cast<unsigned char>(c1_s[0]));
+                if (!strong_subword && !(is_entity_or_num(w3) && is_entity_or_num(steps[0].cand))) {
+                    sched_len = 0;
+                }
+            }
+            if (sched_len > 0) {
+                for (int32_t k = 0; k < sched_len; ++k) {
+                    draft_out.push_back(steps[k].cand);
+                    last_draft_buckets_[static_cast<size_t>(k)] = steps[k].bucket;
+                }
+                last_draft_len_ = sched_len;
+                return;
             }
         }
     }

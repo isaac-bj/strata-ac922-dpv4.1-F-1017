@@ -945,7 +945,7 @@ int32_t Qwen4ExpGfx1201Engine::sample_from_device_logits(const Nvfp4SamplingPara
 }
 
 void Qwen4ExpGfx1201Engine::save_recurrent_ckpt() {
-    HIP_CHECK(hipMemcpyAsync(d_recurrent_ckpt_, d_recurrent_arena_, recurrent_arena_bytes_,
+    HIP_CHECK(hipMemcpyAsync(d_recurrent_ckpt_, d_recurrent_arena_, recurrent_ckpt_bytes_,
                              hipMemcpyDeviceToDevice, nullptr));
     for (int l = 0; l < 48; ++l) {
         ckpt_gdn_conv_in_[l] = d_gdn_conv_in_[l];
@@ -954,7 +954,7 @@ void Qwen4ExpGfx1201Engine::save_recurrent_ckpt() {
 }
 
 void Qwen4ExpGfx1201Engine::restore_recurrent_ckpt() {
-    HIP_CHECK(hipMemcpyAsync(d_recurrent_arena_, d_recurrent_ckpt_, recurrent_arena_bytes_,
+    HIP_CHECK(hipMemcpyAsync(d_recurrent_arena_, d_recurrent_ckpt_, recurrent_ckpt_bytes_,
                              hipMemcpyDeviceToDevice, nullptr));
     for (int l = 0; l < 48; ++l) {
         d_gdn_conv_in_[l] = ckpt_gdn_conv_in_[l];
@@ -988,6 +988,12 @@ void Qwen4ExpGfx1201Engine::finish_verify_step(int32_t M, int32_t n_adv) {
             }
         }
     }
+    adapt_vram_experts(h_all_routed_ids_.data(), M, /*min_hits=*/2, /*max_swaps=*/2, n_adv);
+    t_wait_acc_ms_ = 0.0;
+    t_cpu_acc_ms_ = 0.0;
+    n_cpu_exp_acc_ = 0;
+    n_gpu_pcie_acc_ = 0;
+    n_vram_exp_acc_ = 0;
 }
 
 void Qwen4ExpGfx1201Engine::reset_session() {
@@ -1144,17 +1150,19 @@ int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefi
     return 1;
 }
 
-void Qwen4ExpGfx1201Engine::adapt_vram_experts(const int32_t* routed_ids, int32_t M, uint32_t min_hits, int max_swaps) {
+void Qwen4ExpGfx1201Engine::adapt_vram_experts(const int32_t* routed_ids, int32_t M, uint32_t min_hits, int max_swaps,
+                                               int32_t valid_toks) {
     step_counter_++;
     int swaps_done = 0;
     const int32_t pairs_per_layer = M * 10;
+    const int32_t valid_pairs = (valid_toks > 0 && valid_toks < M) ? (valid_toks * 10) : pairs_per_layer;
     for (int l = 0; l < 48; ++l) {
         Nvfp4MoeWeights& mw = layers_[l].moe;
         if (mw.n_dyn <= 0) continue;
         const int32_t* l_ids = routed_ids + static_cast<size_t>(l) * pairs_per_layer;
         bool ptrs_dirty = false;
 
-        for (int32_t i = 0; i < pairs_per_layer; ++i) {
+        for (int32_t i = 0; i < valid_pairs; ++i) {
             int32_t e = l_ids[i];
             if (e < 0 || e >= 512) continue;
             mw.hit_count[e]++;
@@ -1289,9 +1297,10 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     const size_t gdn_conv_bytes = 3 * 10240 * sizeof(uint16_t);
     const size_t gdn_state_bytes = 48 * 128 * 128 * sizeof(float);
     const size_t raw_k_bytes = 1024ULL * 128 * sizeof(uint16_t);
-    recurrent_arena_bytes_ = ple_conv_bytes + 36ULL * (2 * gdn_conv_bytes + gdn_state_bytes) + 12ULL * raw_k_bytes;
+    recurrent_ckpt_bytes_ = ple_conv_bytes + 36ULL * (2 * gdn_conv_bytes + gdn_state_bytes);
+    recurrent_arena_bytes_ = recurrent_ckpt_bytes_ + 12ULL * raw_k_bytes;
     d_recurrent_arena_ = gpu_alloc(recurrent_arena_bytes_, true);
-    d_recurrent_ckpt_ = gpu_alloc(recurrent_arena_bytes_, false);
+    d_recurrent_ckpt_ = gpu_alloc(recurrent_ckpt_bytes_, false);
     void* h_turn = nullptr;
     if (::posix_memalign(&h_turn, 2 * 1024 * 1024, recurrent_arena_bytes_) == 0 && h_turn) {
         (void) ::madvise(h_turn, recurrent_arena_bytes_, MADV_HUGEPAGE);
