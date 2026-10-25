@@ -53,6 +53,22 @@ void dispatch_down_tile80_decode(const CpuExpertJob& jb, int r0) {
     }
 }
 
+void dispatch_gu_tile32_fp8(CpuExpertJob& jb, int r0) {
+    if (g_cpu_has_avx512vnni) {
+        gu_tile32_fp8_avx512(jb, r0);
+    } else {
+        gu_tile32_fp8_avx2(jb, r0);
+    }
+}
+
+void dispatch_down_tile80_decode_fp8(const CpuExpertJob& jb, int r0) {
+    if (g_cpu_has_avx512vnni) {
+        down_tile80_decode_fp8_avx512(jb, r0);
+    } else {
+        down_tile80_decode_fp8_avx2(jb, r0);
+    }
+}
+
 }  // namespace
 
 void quantize_act_bf16_2560(const uint16_t* x_bf16, int8_t* q_x, float* d_x, int32_t* neg_bias_x) {
@@ -133,6 +149,29 @@ void Nvfp4CpuPool::run_decode_batch(CpuExpertJob* jobs, int n_jobs, float* y_acc
     }
 }
 
+void Nvfp4CpuPool::run_mtp_decode_batch(CpuExpertJob* jobs, int n_jobs, float* y_accum_f32) {
+    if (n_jobs <= 0) return;
+    jobs_ = jobs;
+    n_jobs_ = n_jobs;
+
+    // Phase 6: 20 tiles of 32 FP8 gate+up rows per expert
+    launch_phase(6, n_jobs, 20);
+
+    // Phase 7: 32 tiles of 80 FP8 down rows per expert (writing pre-weighted float32 into jb.y_f32)
+    launch_phase(7, n_jobs, 32);
+
+    if (n_jobs > 1) {
+        const float* src0 = jobs[0].y_f32;
+        for (int c = 0; c < 2560; ++c) {
+            float sum = src0[c];
+            for (int j = 1; j < n_jobs; ++j) {
+                sum += jobs[j].y_f32[c];
+            }
+            y_accum_f32[c] = sum;
+        }
+    }
+}
+
 void Nvfp4CpuPool::run_ple_reads(int fd, const uint64_t* offsets, uint8_t* const* dsts, int n_reads) {
     if (n_reads <= 0) return;
     ple_fd_ = fd;
@@ -180,6 +219,14 @@ void Nvfp4CpuPool::do_work() {
             int j = idx / 32;
             int r0 = (idx % 32) * 80;
             dispatch_down_tile80(jobs[j], r0);
+        } else if (ph == 6) {
+            int j = idx / 20;
+            int r0 = (idx % 20) * 32;
+            dispatch_gu_tile32_fp8(jobs[j], r0);
+        } else if (ph == 7) {
+            int j = idx / 32;
+            int r0 = (idx % 32) * 80;
+            dispatch_down_tile80_decode_fp8(jobs[j], r0);
         } else {
             int j = idx / 32;
             int r0 = (idx % 32) * 80;

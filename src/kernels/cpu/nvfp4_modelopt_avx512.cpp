@@ -76,6 +76,21 @@ inline __m256 decode_f8_e4m3_8(const uint8_t* sp) {
     return _mm256_castsi256_ps(_mm256_or_si256(_mm256_castps_si256(mag), sign));
 }
 
+// Vectorized 16-byte float8_e4m3fn -> 16x float32 (__m512) decoder in pure SIMD registers
+inline __m512 decode_f8_e4m3_16(const uint8_t* sp) {
+    __m128i raw16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(sp));
+    __m512i b32 = _mm512_cvtepu8_epi32(raw16);
+    __m512i sign = _mm512_slli_epi32(_mm512_and_si512(b32, _mm512_set1_epi32(0x80)), 24);
+    __m512i exp = _mm512_and_si512(_mm512_srli_epi32(b32, 3), _mm512_set1_epi32(15));
+    __m512i man = _mm512_and_si512(b32, _mm512_set1_epi32(7));
+    __m512i norm_i = _mm512_or_si512(_mm512_slli_epi32(_mm512_add_epi32(exp, _mm512_set1_epi32(120)), 23),
+                                     _mm512_slli_epi32(man, 20));
+    __m512 sub = _mm512_mul_ps(_mm512_cvtepi32_ps(man), _mm512_set1_ps(0.001953125f));
+    __mmask16 is_sub = _mm512_cmpeq_epi32_mask(exp, _mm512_setzero_si512());
+    __m512 mag = _mm512_mask_blend_ps(is_sub, _mm512_castsi512_ps(norm_i), sub);
+    return _mm512_castsi512_ps(_mm512_or_si512(_mm512_castps_si512(mag), sign));
+}
+
 template <int NT, int NB>
 inline void nvfp4_row_dot_avx512(const uint8_t* wp, const uint8_t* sp,
                                  const int8_t* const* q_x, const float* const* d_x,
@@ -180,22 +195,23 @@ void quantize_act_bf16_2560_avx512(const uint16_t* x_bf16, int8_t* q_x, float* d
     const __m512 sign_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFFFFFF));
     const __m512i zero = _mm512_setzero_si512();
     const __m512i c12 = _mm512_set1_epi8(12);
-    for (int b = 0; b < 160; ++b) {
-        __m256i bf = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_bf16 + 16 * b));
-        __m512 xv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(bf), 16));
-        float amax = _mm512_reduce_max_ps(_mm512_and_ps(xv, sign_mask));
-        if (amax == 0.0f) {
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(q_x + 16 * b), _mm_setzero_si128());
-            d_x[b] = 0.0f;
-        } else {
-            __m512 inv = _mm512_set1_ps(127.0f / amax);
-            __m512i q32 = _mm512_cvtps_epi32(_mm512_mul_ps(xv, inv));
-            __m128i q8 = _mm512_cvtepi32_epi8(q32);
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(q_x + 16 * b), q8);
-            d_x[b] = amax * (0.5f / 127.0f);
-        }
-    }
     for (int b4 = 0; b4 < 160; b4 += 4) {
+        for (int s = 0; s < 4; ++s) {
+            const int b = b4 + s;
+            __m256i bf = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_bf16 + 16 * b));
+            __m512 xv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(bf), 16));
+            float amax = _mm512_reduce_max_ps(_mm512_and_ps(xv, sign_mask));
+            if (amax == 0.0f) {
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(q_x + 16 * b), _mm_setzero_si128());
+                d_x[b] = 0.0f;
+            } else {
+                __m512 inv = _mm512_set1_ps(127.0f / amax);
+                __m512i q32 = _mm512_cvtps_epi32(_mm512_mul_ps(xv, inv));
+                __m128i q8 = _mm512_cvtepi32_epi8(q32);
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(q_x + 16 * b), q8);
+                d_x[b] = amax * (0.5f / 127.0f);
+            }
+        }
         __m512i qv = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(q_x + 16 * b4));
         __m512i nb = _mm512_sub_epi32(zero, _mm512_dpbusd_epi32(zero, c12, qv));
         _mm512_storeu_si512(reinterpret_cast<__m512i*>(neg_bias_x + 4 * b4), nb);
@@ -235,6 +251,82 @@ void down_tile80_decode_modelopt_avx512(const CpuExpertJob& jb, int r0) {
                                     ds_base + static_cast<size_t>(r) * 40,
                                     &q_h_ptr, &d_h_ptr, &nb_h_ptr, &d_f32);
         float y_bf = bf16_bits_to_f32(f32_to_bf16_bits(d_f32 * sd));
+        dst[r] = bf16_bits_to_f32(f32_to_bf16_bits(y_bf * w));
+    }
+}
+
+void gu_tile32_fp8_avx512(CpuExpertJob& jb, int r0) {
+    static constexpr size_t kOffGateW = 0;
+    static constexpr size_t kOffUpW = 1638400;
+    static constexpr size_t kOffGateS = 4915200;
+    static constexpr size_t kOffUpS = 4915456;
+
+    const uint8_t* gw_base = jb.exp_base + kOffGateW + static_cast<size_t>(r0) * 2560;
+    const uint8_t* uw_base = jb.exp_base + kOffUpW + static_cast<size_t>(r0) * 2560;
+    const uint16_t* gs = reinterpret_cast<const uint16_t*>(jb.exp_base + kOffGateS);
+    const uint16_t* us = reinterpret_cast<const uint16_t*>(jb.exp_base + kOffUpS);
+    const float* x_f32 = jb.x_f32;
+    const int rb = (r0 >> 7);
+
+    for (int r = 0; r < 32; ++r) {
+        const uint8_t* gw_row = gw_base + static_cast<size_t>(r) * 2560;
+        const uint8_t* uw_row = uw_base + static_cast<size_t>(r) * 2560;
+        __m512 g_acc = _mm512_setzero_ps();
+        __m512 u_acc = _mm512_setzero_ps();
+        for (int b = 0; b < 20; ++b) {
+            __m512 g_blk = _mm512_setzero_ps();
+            __m512 u_blk = _mm512_setzero_ps();
+            const size_t boff = static_cast<size_t>(b) * 128;
+            _mm_prefetch(reinterpret_cast<const char*>(gw_row + boff + 512), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(uw_row + boff + 512), _MM_HINT_T0);
+#pragma unroll
+            for (int sub = 0; sub < 8; ++sub) {
+                __m512 xv = _mm512_loadu_ps(x_f32 + boff + sub * 16);
+                __m512 gwv = decode_f8_e4m3_16(gw_row + boff + sub * 16);
+                __m512 uwv = decode_f8_e4m3_16(uw_row + boff + sub * 16);
+                g_blk = _mm512_fmadd_ps(gwv, xv, g_blk);
+                u_blk = _mm512_fmadd_ps(uwv, xv, u_blk);
+            }
+            float sc_g = bf16_bits_to_f32(gs[rb * 20 + b]);
+            float sc_u = bf16_bits_to_f32(us[rb * 20 + b]);
+            g_acc = _mm512_fmadd_ps(g_blk, _mm512_set1_ps(sc_g), g_acc);
+            u_acc = _mm512_fmadd_ps(u_blk, _mm512_set1_ps(sc_u), u_acc);
+        }
+        float gf = bf16_bits_to_f32(f32_to_bf16_bits(_mm512_reduce_add_ps(g_acc)));
+        float uf = bf16_bits_to_f32(f32_to_bf16_bits(_mm512_reduce_add_ps(u_acc)));
+        float silu_g = bf16_bits_to_f32(f32_to_bf16_bits(gf / (1.0f + std::exp(-gf))));
+        jb.h_f32[r0 + r] = bf16_bits_to_f32(f32_to_bf16_bits(silu_g * uf));
+    }
+}
+
+void down_tile80_decode_fp8_avx512(const CpuExpertJob& jb, int r0) {
+    static constexpr size_t kOffDownW = 3276800;
+    static constexpr size_t kOffDownS = 4915712;
+
+    const uint8_t* dw_base = jb.exp_base + kOffDownW + static_cast<size_t>(r0) * 640;
+    const uint16_t* ds = reinterpret_cast<const uint16_t*>(jb.exp_base + kOffDownS);
+    const float* h_f32 = jb.h_f32;
+    const float w = jb.weight;
+    float* dst = jb.y_f32 + r0;
+
+    for (int r = 0; r < 80; ++r) {
+        const int rb = (r0 + r) >> 7;
+        const uint8_t* dw_row = dw_base + static_cast<size_t>(r) * 640;
+        __m512 d_acc = _mm512_setzero_ps();
+        for (int b = 0; b < 5; ++b) {
+            __m512 d_blk = _mm512_setzero_ps();
+            const size_t boff = static_cast<size_t>(b) * 128;
+            _mm_prefetch(reinterpret_cast<const char*>(dw_row + boff + 640), _MM_HINT_T0);
+#pragma unroll
+            for (int sub = 0; sub < 8; ++sub) {
+                __m512 hv = _mm512_loadu_ps(h_f32 + boff + sub * 16);
+                __m512 dwv = decode_f8_e4m3_16(dw_row + boff + sub * 16);
+                d_blk = _mm512_fmadd_ps(dwv, hv, d_blk);
+            }
+            float sc_d = bf16_bits_to_f32(ds[rb * 5 + b]);
+            d_acc = _mm512_fmadd_ps(d_blk, _mm512_set1_ps(sc_d), d_acc);
+        }
+        float y_bf = bf16_bits_to_f32(f32_to_bf16_bits(_mm512_reduce_add_ps(d_acc)));
         dst[r] = bf16_bits_to_f32(f32_to_bf16_bits(y_bf * w));
     }
 }

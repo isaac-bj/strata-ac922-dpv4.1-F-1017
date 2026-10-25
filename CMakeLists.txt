@@ -428,7 +428,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_HIP)
     target_sources(strata_kernels PRIVATE
                    src/kernels/cuda/gfx1201_nvfp4_hsaco.cpp
-                   src/kernels/cuda/gfx1201_nvfp4_kernels.cpp)
+                   src/kernels/cuda/gfx1201_nvfp4_kernels.cpp
+                   src/kernels/cuda/nvfp4_mtp_kernels.cu)
   endif()
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,

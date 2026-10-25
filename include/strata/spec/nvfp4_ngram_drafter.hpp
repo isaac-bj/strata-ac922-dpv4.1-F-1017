@@ -23,6 +23,7 @@ public:
     // drafted == 0 records baseline single-token step_token latency.
     // drafted in [1, 3] records verification batch M = 1 + drafted latency and accepted prefix count.
     void observe_step(int32_t drafted, int32_t accepted, double step_ms);
+    void observe_target_confidence(float prob, float margin);
 
     void draft(int32_t cur_tok, size_t prompt_len, const std::vector<int32_t>& history,
                bool enabled, std::vector<int32_t>& draft_out);
@@ -57,9 +58,11 @@ private:
     std::unordered_map<int32_t, std::string> tok_str_cache_;
 
     // DSpark hardware cost model (EMA wall-clock ms for drafted = 0, 1, 2, 3)
-    // On R9700 + 7950X3D: M=1 step_token is ~24.6 ms; M=2,3,4 step_prefill_batch is ~37.5, 39.5, 41.5 ms.
-    std::array<double, 4> ema_step_ms_{{24.6, 37.5, 39.5, 41.5}};
-    double ema_rollback_ms_ = 4.0;
+    // On R9700 + 7950X3D with zero-copy GDN ping-pong + hybrid PCIe MoE verification:
+    std::array<double, 4> ema_step_ms_{{24.2, 29.5, 31.0, 32.5}};
+    double ema_rollback_ms_ = 2.2;
+    float last_target_prob_ = 1.0f;
+    float last_target_margin_ = 10.0f;
 
     // Online empirical survival rate per Markov order bucket:
     // bucket 0: L=1, bucket 1: L=2, bucket 2: L=3, bucket 3: L=4, bucket 4: L>=5

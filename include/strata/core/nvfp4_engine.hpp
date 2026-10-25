@@ -5,6 +5,7 @@
 #include "strata/kernels/cpu/nvfp4_modelopt.hpp"
 #include "strata/kernels/gfx1201_nvfp4_kernels.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/nvfp4_mtp_kernels.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 
 #include <hip/hip_runtime_api.h>
@@ -90,6 +91,19 @@ struct Nvfp4LayerWeights {
     Nvfp4MoeWeights moe;
 };
 
+struct Nvfp4MtpWeights {
+    bool available = false;
+    void* pre_fc_norm_embedding = nullptr; // BF16 [2560]
+    void* pre_fc_norm_hidden = nullptr;    // BF16 [10240]
+    void* fc_embedding = nullptr;          // BF16 [2560, 2560]
+    void* fc_hidden = nullptr;             // BF16 [2560, 2560]
+    Nvfp4HcWeights attn_hc;
+    Nvfp4QsaWeights qsa;
+    Nvfp4HcWeights mlp_hc;
+    Nvfp4MoeWeights moe;
+    Nvfp4HcWeights final_hc;
+};
+
 struct Nvfp4SamplingParams {
     float temperature = 0.0f;
     float top_p = 1.0f;
@@ -138,6 +152,14 @@ public:
     void save_turn_ckpt(const std::vector<int32_t>& ids, int32_t next_tok);
     void restore_turn_ckpt(std::vector<int32_t>& history_out, int32_t& next_tok_out);
 
+    bool has_mtp() const { return mtp_.available; }
+    void mtp_catchup_kv(const std::vector<int32_t>& history, int32_t target_kv_pos);
+    void draft_mtp(int32_t next_tok, const std::vector<int32_t>& history, int32_t max_drafts,
+                   float min_prob, std::vector<int32_t>& draft_out,
+                   std::vector<float>* probs_out = nullptr);
+
+    float last_target_prob() const { return last_target_prob_; }
+    float last_target_margin() const { return last_target_margin_; }
     const std::vector<int32_t>& turn_ckpt_ids() const { return turn_ckpt_ids_; }
     int total_vram_experts() const { return total_vram_experts_; }
     int32_t max_seq() const { return max_seq_; }
@@ -145,11 +167,19 @@ public:
 
 private:
     static constexpr int32_t kMaxBatch = 256;
+    static constexpr int32_t kNumQsaCaches = 13; // 12 main model QSA layers + 1 MTP QSA layer (index 12)
+    static constexpr int32_t kMtpQsaIdx = 12;
+    static constexpr int32_t kMtpRingCap = 512;
+    static constexpr int32_t kMtpRingMask = kMtpRingCap - 1;
 
     int32_t sample_from_device_logits(const Nvfp4SamplingParams& sp,
                                       const std::vector<int32_t>* history,
                                       std::mt19937_64& rng);
-    int32_t run_cpu_moe_layer(int l, int32_t M, bool is_prefill);
+    int32_t run_cpu_moe_layer(int l, int32_t M, bool is_prefill, bool use_gpu_cold_cap = false);
+    int32_t run_mtp_cpu_moe_decode();
+    void run_mtp_kv_batch(const int32_t* next_toks, int32_t cell0, int32_t M);
+    int32_t run_mtp_step_token(int32_t next_tok, int32_t cell, bool from_ring,
+                               float* prob_out = nullptr, float* margin_out = nullptr);
     void adapt_vram_experts(const int32_t* routed_ids, int32_t M, uint32_t min_hits, int max_swaps,
                             int32_t valid_toks = -1);
     void* gpu_alloc(size_t bytes, bool zero = false);
@@ -212,9 +242,9 @@ private:
     size_t host_bk_stride_bytes_ = 0;
     size_t host_bk_mapped_bytes_ = 0;
 
-    int64_t kc_host_delta_[12]{};
-    int64_t vc_host_delta_[12]{};
-    int64_t bk_host_delta_elems_[12]{};
+    int64_t kc_host_delta_[kNumQsaCaches]{};
+    int64_t vc_host_delta_[kNumQsaCaches]{};
+    int64_t bk_host_delta_elems_[kNumQsaCaches]{};
     void* d_qsa_scores_ = nullptr;
     double t_wait_acc_ms_ = 0.0;
     double t_cpu_acc_ms_ = 0.0;
@@ -229,6 +259,22 @@ private:
     void* d_lm_head_ = nullptr;
     Nvfp4HcWeights final_hc_;
     Nvfp4LayerWeights layers_[48];
+    Nvfp4MtpWeights mtp_;
+    bool mtp_hnorm_per_stream_ = false;
+    int32_t mtp_kv_pos_ = 0;
+    int32_t turn_ckpt_mtp_kv_pos_ = 0;
+    float last_target_prob_ = 1.0f;
+    float last_target_margin_ = 10.0f;
+    strata::kernels::Nvfp4ArgmaxSummary verify_summaries_[4]{};
+    void* d_mtp_r_ring_ = nullptr;
+    void* d_mtp_r_state_ = nullptr;
+    void* d_mtp_emb_norm_ = nullptr;
+    void* d_mtp_e2_ = nullptr;
+    void* d_mtp_h_norm_ = nullptr;
+    void* d_mtp_h2_ = nullptr;
+    void* d_argmax_summary_ = nullptr;
+    void* d_moe_gpu_align_ids_ = nullptr;
+    alignas(64) float mtp_act_f32_[2560];
 
     // State & Scratch
     hipEvent_t ev_mixed_ = nullptr;
@@ -284,15 +330,18 @@ private:
     void* d_gdn_state_[48]{};
     void* d_recurrent_arena_ = nullptr;
     void* d_recurrent_ckpt_ = nullptr;
+    void* d_raw_k_arena_ = nullptr;
     void* h_turn_ckpt_ = nullptr;
     size_t recurrent_arena_bytes_ = 0;
     size_t recurrent_ckpt_bytes_ = 0;
+    size_t raw_k_arena_bytes_ = 0;
     void* init_gdn_conv_in_[48]{};
     void* init_gdn_conv_out_[48]{};
     void* ckpt_gdn_conv_in_[48]{};
     void* ckpt_gdn_conv_out_[48]{};
     void* turn_ckpt_gdn_conv_in_[48]{};
     void* turn_ckpt_gdn_conv_out_[48]{};
+    bool turn_ckpt_conv_swapped_[48]{};
     std::vector<int32_t> turn_ckpt_ids_;
     int32_t turn_ckpt_next_tok_ = -1;
     bool serve_mode_ = false;
@@ -313,10 +362,10 @@ private:
     void* d_attn_pm_ = nullptr;
     void* d_attn_pl_ = nullptr;
     void* d_attn_pa_ = nullptr;
-    void* d_k_cache_[12]{};
-    void* d_v_cache_[12]{};
-    void* d_raw_k_cache_[12]{};
-    void* d_block_k_cache_[12]{};
+    void* d_k_cache_[kNumQsaCaches]{};
+    void* d_v_cache_[kNumQsaCaches]{};
+    void* d_raw_k_cache_[kNumQsaCaches]{};
+    void* d_block_k_cache_[kNumQsaCaches]{};
 
     void* d_rope_cos_f32_ = nullptr;
     void* d_rope_sin_f32_ = nullptr;

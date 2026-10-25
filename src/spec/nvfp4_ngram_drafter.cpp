@@ -157,12 +157,17 @@ bool Nvfp4NgramDrafter::is_content_token(int32_t id) {
     return true;
 }
 
+void Nvfp4NgramDrafter::observe_target_confidence(float prob, float margin) {
+    last_target_prob_ = std::clamp(prob, 0.0f, 1.0f);
+    last_target_margin_ = std::max(0.0f, margin);
+}
+
 void Nvfp4NgramDrafter::observe_step(int32_t drafted, int32_t accepted, double step_ms) {
     if (step_ms >= 5.0 && step_ms <= 200.0) {
         if (drafted == 0) {
             ema_step_ms_[0] = 0.85 * ema_step_ms_[0] + 0.15 * step_ms;
             for (size_t k = 1; k <= 3; ++k) {
-                const double min_ver = ema_step_ms_[0] * (1.42 + 0.06 * static_cast<double>(k));
+                const double min_ver = ema_step_ms_[0] * (1.18 + 0.05 * static_cast<double>(k));
                 if (ema_step_ms_[k] < min_ver) ema_step_ms_[k] = min_ver;
             }
         } else if (drafted >= 1 && drafted <= 3) {
@@ -172,7 +177,7 @@ void Nvfp4NgramDrafter::observe_step(int32_t drafted, int32_t accepted, double s
                     0.80 * ema_step_ms_[static_cast<size_t>(drafted)] + 0.20 * step_ms;
             } else {
                 // Partial/zero acceptance: step_ms includes GDN recurrent state restore + replay
-                double est_verify = std::max(ema_step_ms_[0] * 1.45, step_ms - ema_rollback_ms_);
+                double est_verify = std::max(ema_step_ms_[0] * 1.20, step_ms - ema_rollback_ms_);
                 ema_step_ms_[static_cast<size_t>(drafted)] =
                     0.85 * ema_step_ms_[static_cast<size_t>(drafted)] + 0.15 * est_verify;
             }
@@ -224,6 +229,15 @@ double Nvfp4NgramDrafter::estimate_step_confidence(const StepStats& st, int32_t 
     // Modulate by empirical consensus and top-2 margin
     conf *= pi_1 * (0.55 + 0.45 * margin);
 
+    // Modulate by target model's softmax top-1 probability & top-2 logit margin (DSpark Eq. 12):
+    // High target certainty on cur_tok reinforces continuation; high target entropy penalizes weak suffixes.
+    if (st.match_order < 4) {
+        const double target_mod = std::clamp(0.84 + 0.16 * static_cast<double>(last_target_prob_) +
+                                             0.015 * std::min<double>(4.0, last_target_margin_),
+                                             0.78, 1.06);
+        conf *= target_mod;
+    }
+
     // Lexical / structural features
     if (is_subword_cont(prev_id, st.cand, next_id)) {
         const std::string& cs = get_tok_str(st.cand);
@@ -270,7 +284,7 @@ int32_t Nvfp4NgramDrafter::schedule_prefix(const StepStats* steps, int32_t num_c
         a_l *= c_l;
         expected_adv += a_l;
 
-        const double min_ver = t_base * (1.42 + 0.06 * static_cast<double>(l));
+        const double min_ver = t_base * (1.18 + 0.05 * static_cast<double>(l));
         const double t_ver = std::max(min_ver, ema_step_ms_[static_cast<size_t>(l)]);
         const double expected_cost = t_ver + (1.0 - a_l) * ema_rollback_ms_;
         const double theta_l = expected_adv / expected_cost;

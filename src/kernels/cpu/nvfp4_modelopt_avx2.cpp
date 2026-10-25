@@ -279,4 +279,68 @@ void down_tile80_decode_modelopt_avx2(const CpuExpertJob& jb, int r0) {
     }
 }
 
+void gu_tile32_fp8_avx2(CpuExpertJob& jb, int r0) {
+    static constexpr size_t kOffGateW = 0;
+    static constexpr size_t kOffUpW = 1638400;
+    static constexpr size_t kOffGateS = 4915200;
+    static constexpr size_t kOffUpS = 4915456;
+
+    const uint8_t* gw_base = jb.exp_base + kOffGateW + static_cast<size_t>(r0) * 2560;
+    const uint8_t* uw_base = jb.exp_base + kOffUpW + static_cast<size_t>(r0) * 2560;
+    const uint16_t* gs = reinterpret_cast<const uint16_t*>(jb.exp_base + kOffGateS);
+    const uint16_t* us = reinterpret_cast<const uint16_t*>(jb.exp_base + kOffUpS);
+    const float* x_f32 = jb.x_f32;
+    const int rb = (r0 >> 7);
+
+    for (int r = 0; r < 32; ++r) {
+        const uint8_t* gw_row = gw_base + static_cast<size_t>(r) * 2560;
+        const uint8_t* uw_row = uw_base + static_cast<size_t>(r) * 2560;
+        float g_acc = 0.0f;
+        float u_acc = 0.0f;
+        for (int b = 0; b < 20; ++b) {
+            float g_blk = 0.0f;
+            float u_blk = 0.0f;
+            const size_t boff = static_cast<size_t>(b) * 128;
+            for (int j = 0; j < 128; ++j) {
+                float xv = x_f32[boff + j];
+                g_blk += kF8E4m3.v[gw_row[boff + j]] * xv;
+                u_blk += kF8E4m3.v[uw_row[boff + j]] * xv;
+            }
+            g_acc += g_blk * bf16_bits_to_f32(gs[rb * 20 + b]);
+            u_acc += u_blk * bf16_bits_to_f32(us[rb * 20 + b]);
+        }
+        float gf = bf16_bits_to_f32(f32_to_bf16_bits(g_acc));
+        float uf = bf16_bits_to_f32(f32_to_bf16_bits(u_acc));
+        float silu_g = bf16_bits_to_f32(f32_to_bf16_bits(gf / (1.0f + std::exp(-gf))));
+        jb.h_f32[r0 + r] = bf16_bits_to_f32(f32_to_bf16_bits(silu_g * uf));
+    }
+}
+
+void down_tile80_decode_fp8_avx2(const CpuExpertJob& jb, int r0) {
+    static constexpr size_t kOffDownW = 3276800;
+    static constexpr size_t kOffDownS = 4915712;
+
+    const uint8_t* dw_base = jb.exp_base + kOffDownW + static_cast<size_t>(r0) * 640;
+    const uint16_t* ds = reinterpret_cast<const uint16_t*>(jb.exp_base + kOffDownS);
+    const float* h_f32 = jb.h_f32;
+    const float w = jb.weight;
+    float* dst = jb.y_f32 + r0;
+
+    for (int r = 0; r < 80; ++r) {
+        const int rb = (r0 + r) >> 7;
+        const uint8_t* dw_row = dw_base + static_cast<size_t>(r) * 640;
+        float d_acc = 0.0f;
+        for (int b = 0; b < 5; ++b) {
+            float d_blk = 0.0f;
+            const size_t boff = static_cast<size_t>(b) * 128;
+            for (int j = 0; j < 128; ++j) {
+                d_blk += kF8E4m3.v[dw_row[boff + j]] * h_f32[boff + j];
+            }
+            d_acc += d_blk * bf16_bits_to_f32(ds[rb * 5 + b]);
+        }
+        float y_bf = bf16_bits_to_f32(f32_to_bf16_bits(d_acc));
+        dst[r] = bf16_bits_to_f32(f32_to_bf16_bits(y_bf * w));
+    }
+}
+
 }  // namespace strata::kernels::cpu

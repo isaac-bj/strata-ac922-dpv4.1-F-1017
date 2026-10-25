@@ -292,6 +292,8 @@ int32_t Qwen4ExpGfx1201Engine::step_token(int32_t token_id, int32_t prev0, int32
                 void* asc[] = {&d_qsa_idx_qk_, &lw.qsa.idx_q_ln, &d_rope_cos_bf16_, &d_rope_sin_bf16_,
                                &bkc, &d_qsa_scores_, &bk_delta, &pos, &vram_blocks_, &max_blocks_, &eps};
                 kernels_.launch("qsa_score_blocks_tiered", score_grid, 1, 1, asc);
+                strata::kernels::launch_nvfp4_qsa_pin_sink_and_window(
+                    static_cast<float*>(d_qsa_scores_), pos, 1, max_blocks_, 16, 64, nullptr);
                 void* atk[] = {&d_qsa_scores_, &d_qsa_sel_ids_, &pos, &max_blocks_};
                 kernels_.launch("qsa_topk_blocks", 1, 1, 1, atk);
                 int32_t splits = 9;
@@ -374,6 +376,12 @@ int32_t Qwen4ExpGfx1201Engine::step_token(int32_t token_id, int32_t prev0, int32
     }
 
     if (!compute_logits) {
+        if (mtp_.available) {
+            void* args[] = {&cur_x, &prev_out, &prev_inj, &alt_x};
+            kernels_.launch_default("hc_residual_add", args);
+            std::swap(cur_x, alt_x);
+            strata::kernels::launch_nvfp4_mtp_ring_write(cur_x, d_mtp_r_ring_, pos, kMtpRingMask, 1, nullptr);
+        }
         adapt_vram_experts(h_all_routed_ids_.data(), 1, /*min_hits=*/2, /*max_swaps=*/2);
         t_wait_acc_ms_ = 0.0;
         t_cpu_acc_ms_ = 0.0;
@@ -390,6 +398,9 @@ int32_t Qwen4ExpGfx1201Engine::step_token(int32_t token_id, int32_t prev0, int32
                         &d_hc_h_, &d_hc_h_, &d_hc_rstd_, &zero_delta, &eps};
         kernels_.launch_default("hc_premix_decode_c0_u1", args);
         std::swap(cur_x, alt_x);
+        if (mtp_.available) {
+            strata::kernels::launch_nvfp4_mtp_ring_write(cur_x, d_mtp_r_ring_, pos, kMtpRingMask, 1, nullptr);
+        }
         void* m_args[] = {&cur_x, &final_hc_.norm, &d_hc_rstd_, &d_hc_h_, &final_hc_.up, &d_final_hidden_, &one};
         kernels_.launch_default("hc_mix_decode", m_args);
     }
@@ -399,8 +410,9 @@ int32_t Qwen4ExpGfx1201Engine::step_token(int32_t token_id, int32_t prev0, int32
         void* a_lm[] = {&d_final_hidden_, &d_lm_head_, &d_logits_bf16_};
         kernels_.launch_default("bf16_gemv_248320_2560", a_lm);
         if (!use_sampling) {
-            void* a_am[] = {&d_logits_bf16_, &d_next_tok_};
-            kernels_.launch_default("argmax_248320", a_am);
+            strata::kernels::launch_nvfp4_argmax_prob_margin_248320(
+                d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
+                static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), 1, nullptr);
         }
     }
 
@@ -409,7 +421,11 @@ int32_t Qwen4ExpGfx1201Engine::step_token(int32_t token_id, int32_t prev0, int32
     if (use_sampling) {
         next_id = sample_from_device_logits(*sp, history, *rng);
     } else {
-        HIP_CHECK(hipMemcpy(&next_id, d_next_tok_, sizeof(int32_t), hipMemcpyDeviceToHost));
+        strata::kernels::Nvfp4ArgmaxSummary s{};
+        HIP_CHECK(hipMemcpy(&s, d_argmax_summary_, sizeof(s), hipMemcpyDeviceToHost));
+        next_id = s.tok_id;
+        last_target_prob_ = s.prob;
+        last_target_margin_ = s.margin;
     }
     auto t_adapt0 = std::chrono::steady_clock::now();
     adapt_vram_experts(h_all_routed_ids_.data(), 1, /*min_hits=*/2, /*max_swaps=*/2);
@@ -646,6 +662,8 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                     void* asc[] = {&qk_cur, &lw.qsa.idx_q_ln, &d_rope_cos_bf16_, &d_rope_sin_bf16_,
                                    &bkc, &d_qsa_scores_, &bk_delta, &pos_cur, &vram_blocks_, &score_stride, &eps};
                     kernels_.launch("qsa_score_blocks_tiered", score_grid, m_cur, 1, asc);
+                    strata::kernels::launch_nvfp4_qsa_pin_sink_and_window(
+                        static_cast<float*>(d_qsa_scores_), pos_cur, m_cur, score_stride, 16, 64, nullptr);
                     void* atk[] = {&d_qsa_scores_, &sel_cur, &pos_cur, &score_stride};
                     kernels_.launch("qsa_topk_blocks", m_cur, 1, 1, atk);
                 }
@@ -680,6 +698,13 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
         }
 
         {
+            static const int32_t verify_gpu_cold_cap = []() {
+                if (const char* e = std::getenv("STRATA_VERIFY_GPU_COLD")) {
+                    return std::clamp(std::atoi(e), 0, 40);
+                }
+                return 0;
+            }();
+            const bool is_verify_batch = (verify_next_toks_out != nullptr && M <= 4 && verify_gpu_cold_cap > 0);
             void* a_in[] = {&d_mixed_, &lw.moe.in_proj_fused, &d_proj_scratch_, &M};
             kernels_.launch("bf16_linear_1856_2560", 29, m_tiles16, 1, a_in);
 
@@ -688,6 +713,16 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
             int32_t stride1856 = 1856;
             void* a_tk[] = {&r_logits, &d_cur_ids, &d_moe_wts_, &M, &stride1856};
             kernels_.launch("moe_topk", (M + 3) / 4, 1, 1, a_tk);
+
+            int32_t pairs = M * 10;
+            if (is_verify_batch) {
+                strata::kernels::launch_nvfp4_moe_cap_gpu_cold(
+                    static_cast<int32_t*>(d_cur_ids),
+                    static_cast<int32_t*>(d_moe_gpu_align_ids_),
+                    static_cast<const int64_t*>(lw.moe.d_ptrs),
+                    static_cast<const int64_t*>(lw.moe.d_ptrs_prefill),
+                    pairs, verify_gpu_cold_cap, nullptr);
+            }
 
             HIP_CHECK(hipMemcpyAsync(h_route_bell_, d_route_bell_,
                                      static_cast<size_t>(M) * (2560 * sizeof(uint16_t) + 10 * sizeof(int32_t)),
@@ -701,12 +736,12 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
             void* a_d[] = {&d_sh_inter_, &lw.moe.sh_down, &d_sh_out_, &M};
             kernels_.launch("bf16_linear_2560_640", 40, m_tiles16, 1, a_d);
 
-            int32_t pairs = M * 10;
             int32_t max_tiles = (pairs + 15) / 16 + std::min(512, pairs);
-            void* a_al[] = {&d_cur_ids, &d_moe_sorted_, &d_moe_tile_e_, &pairs, &max_tiles};
+            void* align_ids = is_verify_batch ? d_moe_gpu_align_ids_ : d_cur_ids;
+            void* a_al[] = {&align_ids, &d_moe_sorted_, &d_moe_tile_e_, &pairs, &max_tiles};
             kernels_.launch("moe_align", 1, 1, 1, a_al);
 
-            void* ptrs = lw.moe.d_ptrs_prefill;
+            void* ptrs = is_verify_batch ? lw.moe.d_ptrs : lw.moe.d_ptrs_prefill;
             void* s2 = lw.moe.d_s2;
             int32_t topk10 = 10;
             void* a_gu[] = {&d_mixed_, &d_moe_sorted_, &d_moe_tile_e_, &ptrs, &s2, &d_moe_inter_, &topk10};
@@ -757,7 +792,7 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                 }
             }
 
-            (void) run_cpu_moe_layer(l, M, /*is_prefill=*/true);
+            (void) run_cpu_moe_layer(l, M, /*is_prefill=*/true, is_verify_batch);
 
             void* a_cb[] = {&d_moe_y_, &d_moe_wts_, &d_sh_out_, &sh_sc, &d_mlp_out_, &stride1856};
             kernels_.launch("moe_combine", M, 1, 1, a_cb);
@@ -769,6 +804,12 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
     }
 
     if (!compute_logits) {
+        if (mtp_.available) {
+            void* args[] = {&cur_x, &prev_out, &prev_inj, &alt_x};
+            kernels_.launch("hc_residual_add", 40, M, 1, args);
+            std::swap(cur_x, alt_x);
+            strata::kernels::launch_nvfp4_mtp_ring_write(cur_x, d_mtp_r_ring_, pos0, kMtpRingMask, M, nullptr);
+        }
         adapt_vram_experts(h_all_routed_ids_.data(), M, /*min_hits=*/2, /*max_swaps=*/12);
         return -1;
     }
@@ -779,22 +820,31 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                         &d_hc_h_, &d_hc_h_, &d_hc_rstd_, &zero_delta, &M, &eps};
         kernels_.launch("hc_premix_c0_u1", 80, M, 1, args);
         std::swap(cur_x, alt_x);
+        if (mtp_.available) {
+            strata::kernels::launch_nvfp4_mtp_ring_write(cur_x, d_mtp_r_ring_, pos0, kMtpRingMask, M, nullptr);
+        }
         void* m_args[] = {&cur_x, &final_hc_.norm, &d_hc_rstd_, &d_hc_h_, &final_hc_.up, &d_attn_out_, &M};
         kernels_.launch("hc_mix", 80, M, 1, m_args);
         void* a_lm[] = {&d_attn_out_, &d_lm_head_, &d_logits_bf16_, &M};
         kernels_.launch_default("bf16_gemv_m4_248320_2560", a_lm);
-        for (int32_t t = 0; t < M; ++t) {
-            void* log_t = static_cast<uint16_t*>(d_logits_bf16_) + static_cast<size_t>(t) * 248320;
-            void* out_t = static_cast<int32_t*>(d_next_tok_) + t;
-            void* a_am[] = {&log_t, &out_t};
-            kernels_.launch_default("argmax_248320", a_am);
-        }
-        HIP_CHECK(hipMemcpy(verify_next_toks_out, d_next_tok_, static_cast<size_t>(M) * sizeof(int32_t),
+        strata::kernels::launch_nvfp4_argmax_prob_margin_248320(
+            d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
+            static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), M, nullptr);
+        HIP_CHECK(hipMemcpy(verify_summaries_, d_argmax_summary_,
+                            static_cast<size_t>(M) * sizeof(strata::kernels::Nvfp4ArgmaxSummary),
                             hipMemcpyDeviceToHost));
+        for (int32_t t = 0; t < M; ++t) {
+            verify_next_toks_out[t] = verify_summaries_[t].tok_id;
+        }
         return verify_next_toks_out[M - 1];
     }
 
     {
+        if (mtp_.available && M > 1) {
+            int32_t m_prev = M - 1;
+            void* args_r[] = {&cur_x, &prev_out, &prev_inj, &alt_x};
+            kernels_.launch("hc_residual_add", 40, m_prev, 1, args_r);
+        }
         void* last_x = static_cast<uint16_t*>(cur_x) + static_cast<size_t>(M - 1) * 10240;
         void* last_alt = static_cast<uint16_t*>(alt_x) + static_cast<size_t>(M - 1) * 10240;
         void* last_out = static_cast<uint16_t*>(prev_out) + static_cast<size_t>(M - 1) * 2560;
@@ -803,6 +853,9 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
         void* args[] = {&last_x, &last_out, &last_inj, &last_alt, &final_hc_.norm, &final_hc_.down,
                         &d_hc_h_, &d_hc_h_, &d_hc_rstd_, &zero_delta, &one, &eps};
         kernels_.launch_default("hc_premix_c0_u1", args);
+        if (mtp_.available) {
+            strata::kernels::launch_nvfp4_mtp_ring_write(alt_x, d_mtp_r_ring_, pos0, kMtpRingMask, M, nullptr);
+        }
         void* m_args[] = {&last_alt, &final_hc_.norm, &d_hc_rstd_, &d_hc_h_, &final_hc_.up, &d_final_hidden_, &one};
         kernels_.launch_default("hc_mix_decode", m_args);
     }
@@ -812,8 +865,9 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
         void* a_lm[] = {&d_final_hidden_, &d_lm_head_, &d_logits_bf16_};
         kernels_.launch_default("bf16_gemv_248320_2560", a_lm);
         if (!use_sampling) {
-            void* a_am[] = {&d_logits_bf16_, &d_next_tok_};
-            kernels_.launch_default("argmax_248320", a_am);
+            strata::kernels::launch_nvfp4_argmax_prob_margin_248320(
+                d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
+                static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), 1, nullptr);
         }
     }
 
@@ -821,7 +875,11 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
     if (use_sampling) {
         next_id = sample_from_device_logits(*sp, history, *rng);
     } else {
-        HIP_CHECK(hipMemcpy(&next_id, d_next_tok_, sizeof(int32_t), hipMemcpyDeviceToHost));
+        strata::kernels::Nvfp4ArgmaxSummary s{};
+        HIP_CHECK(hipMemcpy(&s, d_argmax_summary_, sizeof(s), hipMemcpyDeviceToHost));
+        next_id = s.tok_id;
+        last_target_prob_ = s.prob;
+        last_target_margin_ = s.margin;
     }
     adapt_vram_experts(h_all_routed_ids_.data(), M, /*min_hits=*/2, /*max_swaps=*/12);
 
@@ -954,15 +1012,27 @@ void Qwen4ExpGfx1201Engine::save_recurrent_ckpt() {
 }
 
 void Qwen4ExpGfx1201Engine::restore_recurrent_ckpt() {
-    HIP_CHECK(hipMemcpyAsync(d_recurrent_arena_, d_recurrent_ckpt_, recurrent_ckpt_bytes_,
-                             hipMemcpyDeviceToDevice, nullptr));
+    // Zero-copy ping-pong recurrent state restore:
+    // Swap d_recurrent_arena_ and d_recurrent_ckpt_ in-place and rebase all GDN/PLE recurrent pointers
+    // without copying 112.4 MiB across VRAM on rollback.
+    const intptr_t delta = static_cast<uint8_t*>(d_recurrent_ckpt_) - static_cast<uint8_t*>(d_recurrent_arena_);
+    std::swap(d_recurrent_arena_, d_recurrent_ckpt_);
+    d_ple_conv_state_ = static_cast<uint8_t*>(d_ple_conv_state_) + delta;
     for (int l = 0; l < 48; ++l) {
-        d_gdn_conv_in_[l] = ckpt_gdn_conv_in_[l];
-        d_gdn_conv_out_[l] = ckpt_gdn_conv_out_[l];
+        if (l % 4 != 3) {
+            d_gdn_conv_in_[l] = static_cast<uint8_t*>(ckpt_gdn_conv_in_[l]) + delta;
+            d_gdn_conv_out_[l] = static_cast<uint8_t*>(ckpt_gdn_conv_out_[l]) + delta;
+            d_gdn_state_[l] = static_cast<uint8_t*>(d_gdn_state_[l]) + delta;
+            init_gdn_conv_in_[l] = static_cast<uint8_t*>(init_gdn_conv_in_[l]) + delta;
+            init_gdn_conv_out_[l] = static_cast<uint8_t*>(init_gdn_conv_out_[l]) + delta;
+        }
     }
 }
 
 void Qwen4ExpGfx1201Engine::finish_verify_step(int32_t M, int32_t n_adv) {
+    int32_t acc_idx = std::clamp(n_adv - 1, 0, std::max(0, M - 1));
+    last_target_prob_ = verify_summaries_[acc_idx].prob;
+    last_target_margin_ = verify_summaries_[acc_idx].margin;
     if (n_adv < M) {
         restore_recurrent_ckpt();
         for (int32_t t = 0; t < n_adv; ++t) {
@@ -997,36 +1067,415 @@ void Qwen4ExpGfx1201Engine::finish_verify_step(int32_t M, int32_t n_adv) {
 }
 
 void Qwen4ExpGfx1201Engine::reset_session() {
-    HIP_CHECK(hipMemsetAsync(d_recurrent_arena_, 0, recurrent_arena_bytes_, nullptr));
+    HIP_CHECK(hipMemsetAsync(d_recurrent_arena_, 0, recurrent_ckpt_bytes_, nullptr));
+    if (d_raw_k_arena_ && raw_k_arena_bytes_ > 0) {
+        HIP_CHECK(hipMemsetAsync(d_raw_k_arena_, 0, raw_k_arena_bytes_, nullptr));
+    }
     for (int l = 0; l < 48; ++l) {
         d_gdn_conv_in_[l] = init_gdn_conv_in_[l];
         d_gdn_conv_out_[l] = init_gdn_conv_out_[l];
     }
+    mtp_kv_pos_ = 0;
 }
 
 void Qwen4ExpGfx1201Engine::save_turn_ckpt(const std::vector<int32_t>& ids, int32_t next_tok) {
     if (!h_turn_ckpt_) return;
-    HIP_CHECK(hipMemcpy(h_turn_ckpt_, d_recurrent_arena_, recurrent_arena_bytes_, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(h_turn_ckpt_, d_recurrent_arena_, recurrent_ckpt_bytes_, hipMemcpyDeviceToHost));
+    if (d_raw_k_arena_ && raw_k_arena_bytes_ > 0) {
+        HIP_CHECK(hipMemcpy(static_cast<uint8_t*>(h_turn_ckpt_) + recurrent_ckpt_bytes_,
+                            d_raw_k_arena_, raw_k_arena_bytes_, hipMemcpyDeviceToHost));
+    }
     for (int l = 0; l < 48; ++l) {
-        turn_ckpt_gdn_conv_in_[l] = d_gdn_conv_in_[l];
-        turn_ckpt_gdn_conv_out_[l] = d_gdn_conv_out_[l];
+        turn_ckpt_conv_swapped_[l] = (d_gdn_conv_in_[l] != init_gdn_conv_in_[l]);
     }
     turn_ckpt_ids_ = ids;
     turn_ckpt_next_tok_ = next_tok;
+    turn_ckpt_mtp_kv_pos_ = mtp_kv_pos_;
 }
 
 void Qwen4ExpGfx1201Engine::restore_turn_ckpt(std::vector<int32_t>& history_out, int32_t& next_tok_out) {
     if (!h_turn_ckpt_) return;
-    HIP_CHECK(hipMemcpy(d_recurrent_arena_, h_turn_ckpt_, recurrent_arena_bytes_, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_recurrent_arena_, h_turn_ckpt_, recurrent_ckpt_bytes_, hipMemcpyHostToDevice));
+    if (d_raw_k_arena_ && raw_k_arena_bytes_ > 0) {
+        HIP_CHECK(hipMemcpy(d_raw_k_arena_,
+                            static_cast<const uint8_t*>(h_turn_ckpt_) + recurrent_ckpt_bytes_,
+                            raw_k_arena_bytes_, hipMemcpyHostToDevice));
+    }
     for (int l = 0; l < 48; ++l) {
-        d_gdn_conv_in_[l] = turn_ckpt_gdn_conv_in_[l];
-        d_gdn_conv_out_[l] = turn_ckpt_gdn_conv_out_[l];
+        if (l % 4 != 3) {
+            d_gdn_conv_in_[l] = turn_ckpt_conv_swapped_[l] ? init_gdn_conv_out_[l] : init_gdn_conv_in_[l];
+            d_gdn_conv_out_[l] = turn_ckpt_conv_swapped_[l] ? init_gdn_conv_in_[l] : init_gdn_conv_out_[l];
+        }
     }
     history_out = turn_ckpt_ids_;
     next_tok_out = turn_ckpt_next_tok_;
+    mtp_kv_pos_ = turn_ckpt_mtp_kv_pos_;
 }
 
-int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefill) {
+int32_t Qwen4ExpGfx1201Engine::run_mtp_cpu_moe_decode() {
+    while (hipEventQuery(ev_route_) == hipErrorNotReady) {
+        _mm_pause();
+    }
+    const uint16_t* h_mixed = reinterpret_cast<const uint16_t*>(h_route_bell_);
+    const int32_t* h_ids = reinterpret_cast<const int32_t*>(
+        static_cast<const uint8_t*>(h_route_bell_) + 2560 * sizeof(uint16_t));
+    const float* h_wts = reinterpret_cast<const float*>(h_ids + 10);
+
+    struct MissItem {
+        int32_t e;
+        int32_t pair;
+    };
+    MissItem misses[10];
+    int32_t n_miss = 0;
+    for (int32_t p = 0; p < 10; ++p) {
+        int32_t raw_id = h_ids[p];
+        int32_t e = (raw_id >= 0) ? (raw_id & 0xFFFF) : -1;
+        if (e < 0 || e >= 512) continue;
+        bool forced_cpu = (raw_id & 0x10000) != 0;
+        if (forced_cpu || !mtp_.moe.in_gpu_cold[e]) {
+            misses[n_miss++] = MissItem{e, p};
+        }
+    }
+    if (n_miss == 0) return 0;
+
+    for (int32_t k = 0; k < 2560; ++k) {
+        mtp_act_f32_[k] = bf16_bits_to_f32(h_mixed[k]);
+    }
+    float* h_accum_f32 = reinterpret_cast<float*>(h_cpu_upload_);
+    for (int32_t i = 0; i < n_miss; ++i) {
+        int32_t e = misses[i].e;
+        int32_t p = misses[i].pair;
+        CpuExpertJob& jb = cpu_jobs_[i];
+        jb.exp_base = mtp_.moe.host_cpu_ptr[e];
+        jb.weight = h_wts[p];
+        jb.nt = 1;
+        jb.x_f32 = mtp_act_f32_;
+        jb.d_x[0] = mtp_act_f32_;
+        jb.y_f32 = (n_miss == 1) ? h_accum_f32 : (h_accum_f32 + static_cast<size_t>(i + 1) * 2560);
+    }
+    cpu_pool_.run_mtp_decode_batch(cpu_jobs_.data(), n_miss, h_accum_f32);
+    HIP_CHECK(hipMemcpyAsync(d_cpu_upload_, h_accum_f32, 2560 * sizeof(float), hipMemcpyHostToDevice, nullptr));
+    return 1;
+}
+
+void Qwen4ExpGfx1201Engine::run_mtp_kv_batch(const int32_t* next_toks, int32_t cell0, int32_t M) {
+    if (!mtp_.available || M <= 0) return;
+    ensure_context_capacity(cell0 + M);
+
+    uint8_t* h_ple_rows = static_cast<uint8_t*>(h_step_meta_) + 16;
+    uint8_t* h_batch_toks = h_ple_rows + static_cast<size_t>(M) * 2560;
+    std::memcpy(h_batch_toks, next_toks, static_cast<size_t>(M) * sizeof(int32_t));
+    void* d_batch_toks = static_cast<uint8_t*>(d_ple_rows_u8_) + static_cast<size_t>(M) * 2560;
+    HIP_CHECK(hipMemcpyAsync(d_batch_toks, h_batch_toks, static_cast<size_t>(M) * sizeof(int32_t),
+                             hipMemcpyHostToDevice, nullptr));
+
+    float eps = 1e-6f;
+    const int32_t m_tiles16 = (M + 15) / 16;
+    const int32_t m_tiles64 = (M + 63) / 64;
+    const bool use_wmma_hc = (M >= 16);
+
+    strata::kernels::launch_nvfp4_mtp_emb_rms_norm(
+        static_cast<const int32_t*>(d_batch_toks), d_embed_tokens_,
+        mtp_.pre_fc_norm_embedding, d_mtp_emb_norm_, M, eps, nullptr);
+    strata::kernels::launch_nvfp4_mtp_hidden_rms_norm(
+        d_mtp_r_ring_, cell0, kMtpRingMask, mtp_.pre_fc_norm_hidden,
+        d_mtp_h_norm_, M, eps, mtp_hnorm_per_stream_, nullptr);
+
+    {
+        void* a_fe[] = {&d_mtp_emb_norm_, &mtp_.fc_embedding, &d_mtp_e2_, &M};
+        kernels_.launch("bf16_linear_2560_2560", 40, m_tiles16, 1, a_fe);
+        int32_t M4 = 4 * M;
+        int32_t m4_tiles16 = (M4 + 15) / 16;
+        void* a_fh[] = {&d_mtp_h_norm_, &mtp_.fc_hidden, &d_mtp_h2_, &M4};
+        kernels_.launch("bf16_linear_2560_2560", 40, m4_tiles16, 1, a_fh);
+    }
+    strata::kernels::launch_nvfp4_mtp_stream_broadcast_add(
+        d_mtp_h2_, d_mtp_e2_, d_x_stream_a_, M, nullptr);
+
+    void* cur_x = d_x_stream_a_;
+    {
+        int64_t wi_delta = mtp_.attn_hc.wi_delta;
+        void* args_hc[] = {&cur_x, &cur_x, &cur_x, &cur_x, &mtp_.attn_hc.norm, &mtp_.attn_hc.down,
+                           &d_hc_h_, &d_attn_inj_, &d_hc_rstd_, &wi_delta, &M, &eps};
+        if (use_wmma_hc) {
+            kernels_.launch("hc_premix_wmma_c1_u0", 21, m_tiles64, 1, args_hc);
+        } else {
+            kernels_.launch("hc_premix_c1_u0", 81, M, 1, args_hc);
+        }
+        void* m_args[] = {&cur_x, &mtp_.attn_hc.norm, &d_hc_rstd_, &d_hc_h_, &mtp_.attn_hc.up, &d_mixed_, &M};
+        if (use_wmma_hc) {
+            kernels_.launch("hc_mix_wmma", 40, m_tiles64, 1, m_args);
+        } else {
+            kernels_.launch("hc_mix", 80, M, 1, m_args);
+        }
+    }
+
+    const void* w_kv_idx = static_cast<const uint16_t*>(mtp_.qsa.in_proj_fused) + 12288ULL * 2560;
+    strata::kernels::launch_nvfp4_mtp_kv_idx_proj(
+        d_mixed_, w_kv_idx, d_qsa_k_b_, d_qsa_v_b_, d_qsa_idx_qk_b_, M, nullptr);
+
+    {
+        void* cos_p = static_cast<uint8_t*>(d_rope_cos_f32_) + static_cast<size_t>(cell0) * 32 * sizeof(float);
+        void* sin_p = static_cast<uint8_t*>(d_rope_sin_f32_) + static_cast<size_t>(cell0) * 32 * sizeof(float);
+        int32_t r2 = M * 2, h2 = 2;
+        void* ak[] = {&d_qsa_k_b_, &mtp_.qsa.k_norm, &cos_p, &sin_p, &d_qsa_k_b_, &r2, &h2, &eps};
+        kernels_.launch("qk_norm_partial_rope", (M * 2 + 7) / 8, 1, 1, ak);
+    }
+
+    void* kc = d_k_cache_[kMtpQsaIdx];
+    void* vc = d_v_cache_[kMtpQsaIdx];
+    void* rkc = d_raw_k_cache_[kMtpQsaIdx];
+    void* bkc = d_block_k_cache_[kMtpQsaIdx];
+    int64_t kc_delta = kc_host_delta_[kMtpQsaIdx];
+    int64_t vc_delta = vc_host_delta_[kMtpQsaIdx];
+    int64_t bk_delta = bk_host_delta_elems_[kMtpQsaIdx];
+    {
+        void* args[] = {&d_qsa_k_b_, &d_qsa_v_b_, &d_qsa_idx_qk_b_, &kc, &vc, &rkc,
+                        &kc_delta, &vc_delta, &cell0, &vram_prefix_};
+        kernels_.launch("qsa_cache_write_nvfp4", 1, M, 1, args);
+    }
+    int32_t b_start = cell0 / 4;
+    int32_t b_end = (cell0 + M) / 4;
+    int32_t b_cnt = b_end - b_start;
+    if (b_cnt > 0) {
+        void* args[] = {&rkc, &mtp_.qsa.idx_k_ln, &d_rope_cos_bf16_, &d_rope_sin_bf16_, &bkc,
+                        &bk_delta, &b_start, &b_cnt, &vram_blocks_, &eps};
+        kernels_.launch("qsa_block_keys_tiered", (b_cnt + 3) / 4, 1, 1, args);
+    }
+}
+
+int32_t Qwen4ExpGfx1201Engine::run_mtp_step_token(int32_t next_tok, int32_t cell, bool from_ring,
+                                                  float* prob_out, float* margin_out) {
+    if (!mtp_.available) return -1;
+    ensure_context_capacity(cell + 1);
+
+    int32_t* meta_i32 = static_cast<int32_t*>(h_step_meta_);
+    meta_i32[0] = next_tok;
+    meta_i32[1] = cell;
+    meta_i32[2] = cell + 1;
+    meta_i32[3] = 0;
+    HIP_CHECK(hipMemcpyAsync(d_step_meta_, h_step_meta_, 16, hipMemcpyHostToDevice, nullptr));
+
+    int32_t one = 1;
+    int32_t four = 4;
+    float eps = 1e-6f;
+    void* d_cur_ids = static_cast<uint8_t*>(d_route_bell_) + 2560 * sizeof(uint16_t);
+    void* d_cur_wts = static_cast<uint8_t*>(d_cur_ids) + 10 * sizeof(int32_t);
+
+    strata::kernels::launch_nvfp4_mtp_emb_rms_norm(
+        static_cast<const int32_t*>(d_tok_id_), d_embed_tokens_,
+        mtp_.pre_fc_norm_embedding, d_mtp_emb_norm_, 1, eps, nullptr);
+    if (from_ring) {
+        strata::kernels::launch_nvfp4_mtp_hidden_rms_norm(
+            d_mtp_r_ring_, cell, kMtpRingMask, mtp_.pre_fc_norm_hidden,
+            d_mtp_h_norm_, 1, eps, mtp_hnorm_per_stream_, nullptr);
+    } else {
+        strata::kernels::launch_nvfp4_mtp_hidden_rms_norm(
+            d_mtp_r_state_, 0, 0, mtp_.pre_fc_norm_hidden,
+            d_mtp_h_norm_, 1, eps, mtp_hnorm_per_stream_, nullptr);
+    }
+    {
+        void* a_fe[] = {&d_mtp_emb_norm_, &mtp_.fc_embedding, &d_mtp_e2_, &one};
+        kernels_.launch("bf16_linear_2560_2560", 40, 1, 1, a_fe);
+        void* a_fh[] = {&d_mtp_h_norm_, &mtp_.fc_hidden, &d_mtp_h2_, &four};
+        kernels_.launch("bf16_linear_2560_2560", 40, 1, 1, a_fh);
+    }
+    strata::kernels::launch_nvfp4_mtp_stream_broadcast_add(
+        d_mtp_h2_, d_mtp_e2_, d_x_stream_a_, 1, nullptr);
+
+    void* cur_x = d_x_stream_a_;
+    void* alt_x = d_x_stream_b_;
+    {
+        int64_t wi_delta = mtp_.attn_hc.wi_delta;
+        void* args[] = {&cur_x, &cur_x, &cur_x, &cur_x, &mtp_.attn_hc.norm, &mtp_.attn_hc.down,
+                        &d_hc_h_, &d_attn_inj_, &d_hc_rstd_, &wi_delta, &eps};
+        kernels_.launch_default("hc_premix_decode_c1_u0", args);
+        void* m_args[] = {&cur_x, &mtp_.attn_hc.norm, &d_hc_rstd_, &d_hc_h_, &mtp_.attn_hc.up, &d_mixed_, &one};
+        kernels_.launch_default("hc_mix_decode", m_args);
+    }
+
+    {
+        void* a1[] = {&d_mixed_, &mtp_.qsa.in_proj_fused, &d_qsa_qg_};
+        kernels_.launch_default("bf16_gemv_13952_2560", a1);
+    }
+    void* kc = d_k_cache_[kMtpQsaIdx];
+    void* vc = d_v_cache_[kMtpQsaIdx];
+    void* rkc = d_raw_k_cache_[kMtpQsaIdx];
+    void* bkc = d_block_k_cache_[kMtpQsaIdx];
+    int64_t kc_delta = kc_host_delta_[kMtpQsaIdx];
+    int64_t vc_delta = vc_host_delta_[kMtpQsaIdx];
+    int64_t bk_delta = bk_host_delta_elems_[kMtpQsaIdx];
+    {
+        void* args[] = {&d_qsa_qg_, &mtp_.qsa.q_norm, &mtp_.qsa.k_norm, &d_rope_cos_f32_, &d_rope_sin_f32_,
+                        &d_qsa_q_, &kc, &vc, &rkc, &kc_delta, &vc_delta, &cell, &vram_prefix_, &eps};
+        kernels_.launch_default("qsa_prep_and_cache_write_nvfp4", args);
+    }
+    if ((cell + 1) % 4 == 0) {
+        int32_t b_start = cell / 4;
+        int32_t count = 1;
+        void* args[] = {&rkc, &mtp_.qsa.idx_k_ln, &d_rope_cos_bf16_, &d_rope_sin_bf16_, &bkc,
+                        &bk_delta, &b_start, &count, &vram_blocks_, &eps};
+        kernels_.launch("qsa_block_keys_tiered", 1, 1, 1, args);
+    }
+    int32_t Lk = cell + 1;
+    int32_t chunk = 256;
+    if (Lk <= 256) {
+        void* af[] = {&d_qsa_q_, &kc, &vc, &d_qsa_qg_, &d_qsa_attn_raw_, &d_seq_k_i32_};
+        kernels_.launch_default("attn_decode_fused_nvfp4", af);
+    } else if (Lk <= 2048) {
+        int32_t splits = (Lk + chunk - 1) / chunk;
+        void* ap[] = {&d_qsa_q_, &kc, &vc, &d_zero_mask_, &d_attn_pm_, &d_attn_pl_, &d_attn_pa_,
+                      &d_seq_k_i32_, &chunk, &splits};
+        kernels_.launch("attn_decode_partial_nvfp4", splits * 24, 1, 1, ap);
+        void* ac[] = {&d_attn_pm_, &d_attn_pl_, &d_attn_pa_, &d_qsa_qg_, &d_qsa_attn_raw_, &splits};
+        kernels_.launch("attn_decode_combine", 24, 1, 1, ac);
+    } else {
+        int32_t nb = (cell + 1) / 4;
+        int32_t score_grid = std::max(1, (nb + 255) / 256);
+        void* asc[] = {&d_qsa_idx_qk_, &mtp_.qsa.idx_q_ln, &d_rope_cos_bf16_, &d_rope_sin_bf16_,
+                       &bkc, &d_qsa_scores_, &bk_delta, &cell, &vram_blocks_, &max_blocks_, &eps};
+        kernels_.launch("qsa_score_blocks_tiered", score_grid, 1, 1, asc);
+        strata::kernels::launch_nvfp4_qsa_pin_sink_and_window(
+            static_cast<float*>(d_qsa_scores_), cell, 1, max_blocks_, 16, 64, nullptr);
+        void* atk[] = {&d_qsa_scores_, &d_qsa_sel_ids_, &cell, &max_blocks_};
+        kernels_.launch("qsa_topk_blocks", 1, 1, 1, atk);
+        int32_t splits = 9;
+        void* ap[] = {&d_qsa_q_, &kc, &vc, &d_qsa_sel_ids_, &d_pos_i32_, &d_attn_pm_, &d_attn_pl_,
+                      &d_attn_pa_, &kc_delta, &vc_delta, &vram_prefix_, &chunk, &splits};
+        kernels_.launch("qsa_sparse_decode_partial_nvfp4", splits * 24, 1, 1, ap);
+        void* ac[] = {&d_attn_pm_, &d_attn_pl_, &d_attn_pa_, &d_qsa_qg_, &d_qsa_attn_raw_, &splits};
+        kernels_.launch("attn_decode_combine", 24, 1, 1, ac);
+    }
+    {
+        void* args[] = {&d_qsa_attn_raw_, &mtp_.qsa.o_proj, &d_attn_out_};
+        kernels_.launch_default("bf16_gemv_2560_6144", args);
+    }
+
+    {
+        int64_t wi_delta = mtp_.mlp_hc.wi_delta;
+        void* args[] = {&cur_x, &d_attn_out_, &d_attn_inj_, &alt_x, &mtp_.mlp_hc.norm, &mtp_.mlp_hc.down,
+                        &d_hc_h_, &d_mlp_inj_, &d_hc_rstd_, &wi_delta, &eps};
+        kernels_.launch_default("hc_premix_decode_c1_u1", args);
+        std::swap(cur_x, alt_x);
+        void* m_args[] = {&cur_x, &mtp_.mlp_hc.norm, &d_hc_rstd_, &d_hc_h_, &mtp_.mlp_hc.up, &d_mixed_, &one};
+        kernels_.launch_default("hc_mix_decode", m_args);
+    }
+
+    {
+        void* a_gu[] = {&d_mixed_, &mtp_.moe.in_proj_fused, &d_sh_gu_};
+        kernels_.launch_default("bf16_gemv_1793_2560", a_gu);
+
+        void* ptrs = mtp_.moe.d_ptrs;
+        void* ptrs_vram = mtp_.moe.d_ptrs_prefill;
+        void* a_ts[] = {&d_sh_gu_, &ptrs, &ptrs_vram, &d_cur_ids, &d_cur_wts, &d_sh_inter_};
+        kernels_.launch_default("moe_topk_and_silu_mul_640", a_ts);
+
+        HIP_CHECK(hipMemcpyAsync(h_route_bell_, d_route_bell_,
+                                 2560 * sizeof(uint16_t) + 10 * sizeof(int32_t) + 10 * sizeof(float),
+                                 hipMemcpyDeviceToHost, nullptr));
+        HIP_CHECK(hipEventRecord(ev_route_, nullptr));
+
+        void* a_d[] = {&d_sh_inter_, &mtp_.moe.sh_down, &d_sh_out_};
+        kernels_.launch_default("bf16_gemv_2560_640", a_d);
+
+        strata::kernels::launch_nvfp4_mtp_moe_decode_gate_up(
+            d_mixed_, static_cast<const int32_t*>(d_cur_ids),
+            static_cast<const int64_t*>(ptrs), d_moe_inter_, nullptr);
+        strata::kernels::launch_nvfp4_mtp_moe_decode_down(
+            d_moe_inter_, static_cast<const int32_t*>(d_cur_ids),
+            static_cast<const int64_t*>(ptrs), d_moe_y_, nullptr);
+
+        int32_t has_cpu = run_mtp_cpu_moe_decode();
+
+        void* a_cb[] = {&d_moe_y_, &d_cur_ids, &ptrs, &d_cur_wts, &d_cpu_upload_,
+                        &d_sh_out_, &d_sh_scale_, &d_mlp_out_, &has_cpu};
+        kernels_.launch_default("moe_combine_decode", a_cb);
+    }
+
+    {
+        int64_t zero_delta = 0;
+        void* prev_out = d_mlp_out_;
+        void* prev_inj = d_mlp_inj_;
+        void* args[] = {&cur_x, &prev_out, &prev_inj, &d_mtp_r_state_, &mtp_.final_hc.norm, &mtp_.final_hc.down,
+                        &d_hc_h_, &d_hc_h_, &d_hc_rstd_, &zero_delta, &eps};
+        kernels_.launch_default("hc_premix_decode_c0_u1", args);
+        void* m_args[] = {&d_mtp_r_state_, &mtp_.final_hc.norm, &d_hc_rstd_, &d_hc_h_, &mtp_.final_hc.up, &d_final_hidden_, &one};
+        kernels_.launch_default("hc_mix_decode", m_args);
+    }
+
+    {
+        void* a_lm[] = {&d_final_hidden_, &d_lm_head_, &d_logits_bf16_};
+        kernels_.launch_default("bf16_gemv_248320_2560", a_lm);
+        strata::kernels::launch_nvfp4_argmax_prob_margin_248320(
+            d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
+            static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), 1, nullptr);
+    }
+
+    strata::kernels::Nvfp4ArgmaxSummary s{};
+    HIP_CHECK(hipMemcpy(&s, d_argmax_summary_, sizeof(s), hipMemcpyDeviceToHost));
+    if (prob_out) *prob_out = s.prob;
+    if (margin_out) *margin_out = s.margin;
+    return s.tok_id;
+}
+
+void Qwen4ExpGfx1201Engine::mtp_catchup_kv(const std::vector<int32_t>& history, int32_t target_kv_pos) {
+    if (!mtp_.available) return;
+    int32_t max_valid = static_cast<int32_t>(history.size()) - 1;
+    int32_t end_pos = std::min(target_kv_pos, max_valid);
+    if (end_pos <= mtp_kv_pos_) return;
+    if (end_pos - mtp_kv_pos_ > kMtpRingCap) {
+        mtp_kv_pos_ = end_pos - kMtpRingCap;
+    }
+    while (mtp_kv_pos_ < end_pos) {
+        int32_t chunk = std::min<int32_t>(kMaxBatch, end_pos - mtp_kv_pos_);
+        run_mtp_kv_batch(&history[mtp_kv_pos_ + 1], mtp_kv_pos_, chunk);
+        mtp_kv_pos_ += chunk;
+    }
+}
+
+void Qwen4ExpGfx1201Engine::draft_mtp(int32_t next_tok, const std::vector<int32_t>& history, int32_t max_drafts,
+                                      float min_prob, std::vector<int32_t>& draft_out,
+                                      std::vector<float>* probs_out) {
+    draft_out.clear();
+    if (probs_out) probs_out->clear();
+    if (!mtp_.available || max_drafts <= 0 || history.empty()) return;
+
+    const int32_t cur_pos = static_cast<int32_t>(history.size());
+    if (mtp_kv_pos_ < cur_pos - 1) {
+        mtp_catchup_kv(history, cur_pos - 1);
+    }
+
+    int32_t cur_tok = next_tok;
+    for (int32_t j = 0; j < max_drafts; ++j) {
+        float prob = 0.0f;
+        float margin = 0.0f;
+        const bool from_ring = (j == 0);
+        const int32_t cell = (cur_pos - 1) + j;
+        int32_t d_tok = run_mtp_step_token(cur_tok, cell, from_ring, &prob, &margin);
+        if (j == 0) {
+            mtp_kv_pos_ = cur_pos;
+        }
+        if (d_tok < 0 || d_tok == 248044 || d_tok == 248046) {
+            break;
+        }
+        // For j == 0, skip batch verification if the MTP draft has very low confidence (< 0.18).
+        // For j > 0, we already executed run_mtp_step_token, and verifying M+1 vs M costs the same 16-row tile,
+        // so include d_tok unless prob is extremely low (< 0.15), and use min_prob to gate launching step j+1.
+        const float keep_floor = (j == 0) ? std::min(min_prob, 0.18f) : 0.15f;
+        if (prob < keep_floor) {
+            break;
+        }
+        draft_out.push_back(d_tok);
+        if (probs_out) probs_out->push_back(prob);
+        cur_tok = d_tok;
+        const float step_chain_thresh = (j == 0) ? min_prob : std::max(min_prob, 0.70f);
+        if (prob < step_chain_thresh) {
+            break;
+        }
+    }
+}
+
+int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefill, bool use_gpu_cold_cap) {
     auto t0 = std::chrono::steady_clock::now();
     while (hipEventQuery(ev_route_) == hipErrorNotReady) {
         _mm_pause();
@@ -1047,7 +1496,7 @@ int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefi
     MissItem misses[kMaxBatch * 10];
     bool tok_needed[kMaxBatch]{};
     int32_t n_miss = 0;
-    const bool use_gpu_cold = !is_prefill;
+    const bool use_gpu_cold = !is_prefill || use_gpu_cold_cap;
     for (int32_t p = 0; p < pairs; ++p) {
         int32_t raw_id = h_ids[p];
         int32_t e = (raw_id >= 0) ? (raw_id & 0xFFFF) : -1;
@@ -1298,9 +1747,11 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     const size_t gdn_state_bytes = 48 * 128 * 128 * sizeof(float);
     const size_t raw_k_bytes = 1024ULL * 128 * sizeof(uint16_t);
     recurrent_ckpt_bytes_ = ple_conv_bytes + 36ULL * (2 * gdn_conv_bytes + gdn_state_bytes);
-    recurrent_arena_bytes_ = recurrent_ckpt_bytes_ + 12ULL * raw_k_bytes;
-    d_recurrent_arena_ = gpu_alloc(recurrent_arena_bytes_, true);
+    raw_k_arena_bytes_ = static_cast<size_t>(kNumQsaCaches) * raw_k_bytes;
+    recurrent_arena_bytes_ = recurrent_ckpt_bytes_ + raw_k_arena_bytes_;
+    d_recurrent_arena_ = gpu_alloc(recurrent_ckpt_bytes_, true);
     d_recurrent_ckpt_ = gpu_alloc(recurrent_ckpt_bytes_, false);
+    d_raw_k_arena_ = gpu_alloc(raw_k_arena_bytes_, true);
     void* h_turn = nullptr;
     if (::posix_memalign(&h_turn, 2 * 1024 * 1024, recurrent_arena_bytes_) == 0 && h_turn) {
         (void) ::madvise(h_turn, recurrent_arena_bytes_, MADV_HUGEPAGE);
@@ -1353,9 +1804,10 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     d_attn_pl_ = gpu_alloc(24 * max_splits * sizeof(float));
     d_attn_pa_ = gpu_alloc(24 * max_splits * 256 * sizeof(float));
 
-    for (int q = 0; q < 12; ++q) {
-        d_raw_k_cache_[q] = rec_cur;
-        rec_cur += raw_k_bytes;
+    uint8_t* raw_k_cur = static_cast<uint8_t*>(d_raw_k_arena_);
+    for (int q = 0; q < kNumQsaCaches; ++q) {
+        d_raw_k_cache_[q] = raw_k_cur;
+        raw_k_cur += raw_k_bytes;
     }
 
     const size_t gran = strata::core::vmm_available()
@@ -1363,7 +1815,7 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
                             : (2ULL * 1024 * 1024);
     vram_kv_stride_bytes_ = ((static_cast<size_t>(vram_cap_) * 2 * 160) + gran - 1) & ~(gran - 1);
     vram_bk_stride_bytes_ = ((static_cast<size_t>(vram_blocks_) * 128 * sizeof(uint16_t)) + gran - 1) & ~(gran - 1);
-    const size_t total_kv_vmm_bytes = 12ULL * (2 * vram_kv_stride_bytes_ + vram_bk_stride_bytes_);
+    const size_t total_kv_vmm_bytes = static_cast<size_t>(kNumQsaCaches) * (2 * vram_kv_stride_bytes_ + vram_bk_stride_bytes_);
 
     kv_vmm_ok_ = strata::core::vmm_available() && kv_vmm_range_.reserve(total_kv_vmm_bytes);
     const int32_t init_vram_seq = kv_grow_ ? std::min<int32_t>(vram_cap_, 6553) : vram_cap_;
@@ -1373,10 +1825,11 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     auto no_take = []() -> strata::core::VmmChunk { return 0; };
     if (kv_vmm_ok_) {
         uint8_t* vbase = kv_vmm_range_.base();
-        for (int q = 0; q < 12; ++q) {
+        for (int q = 0; q < kNumQsaCaches; ++q) {
             size_t k_off = static_cast<size_t>(q) * 2 * vram_kv_stride_bytes_;
             size_t v_off = k_off + vram_kv_stride_bytes_;
-            size_t b_off = 24ULL * vram_kv_stride_bytes_ + static_cast<size_t>(q) * vram_bk_stride_bytes_;
+            size_t b_off = 2ULL * static_cast<size_t>(kNumQsaCaches) * vram_kv_stride_bytes_ +
+                           static_cast<size_t>(q) * vram_bk_stride_bytes_;
             d_k_cache_[q] = vbase + k_off;
             d_v_cache_[q] = vbase + v_off;
             d_block_k_cache_[q] = vbase + b_off;
@@ -1400,7 +1853,7 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
         vram_bk_mapped_bytes_ = init_bk_map;
         kv_mapped_seq_ = static_cast<int32_t>(std::min<size_t>(vram_prefix_, (init_kv_map / 320)));
     } else {
-        for (int q = 0; q < 12; ++q) {
+        for (int q = 0; q < kNumQsaCaches; ++q) {
             d_k_cache_[q] = gpu_alloc(vram_kv_stride_bytes_, true);
             d_v_cache_[q] = gpu_alloc(vram_kv_stride_bytes_, true);
             if (vram_bk_stride_bytes_ > 0) {
@@ -1422,7 +1875,7 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
                                 : 0;
 
     if (host_kv_stride_bytes_ > 0) {
-        host_kv_mmap_bytes_ = 24ULL * host_kv_stride_bytes_;
+        host_kv_mmap_bytes_ = 2ULL * static_cast<size_t>(kNumQsaCaches) * host_kv_stride_bytes_;
         void* p = ::mmap(nullptr, host_kv_mmap_bytes_, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (p == MAP_FAILED) {
@@ -1430,7 +1883,7 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
             std::exit(1);
         }
         host_kv_mmap_ = static_cast<uint8_t*>(p);
-        for (int q = 0; q < 12; ++q) {
+        for (int q = 0; q < kNumQsaCaches; ++q) {
             uint8_t* hk = host_kv_mmap_ + static_cast<size_t>(2 * q) * host_kv_stride_bytes_;
             uint8_t* hv = host_kv_mmap_ + static_cast<size_t>(2 * q + 1) * host_kv_stride_bytes_;
             kc_host_delta_[q] = reinterpret_cast<int64_t>(hk) - reinterpret_cast<int64_t>(d_k_cache_[q]);
@@ -1438,7 +1891,7 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
         }
     }
     if (host_bk_stride_bytes_ > 0) {
-        host_bk_mmap_bytes_ = 12ULL * host_bk_stride_bytes_;
+        host_bk_mmap_bytes_ = static_cast<size_t>(kNumQsaCaches) * host_bk_stride_bytes_;
         void* p = ::mmap(nullptr, host_bk_mmap_bytes_, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (p == MAP_FAILED) {
@@ -1446,7 +1899,7 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
             std::exit(1);
         }
         host_bk_mmap_ = static_cast<uint8_t*>(p);
-        for (int q = 0; q < 12; ++q) {
+        for (int q = 0; q < kNumQsaCaches; ++q) {
             uint8_t* hb = host_bk_mmap_ + static_cast<size_t>(q) * host_bk_stride_bytes_;
             if (!d_block_k_cache_[q]) d_block_k_cache_[q] = hb;
             bk_host_delta_elems_[q] = (reinterpret_cast<int64_t>(hb) - reinterpret_cast<int64_t>(d_block_k_cache_[q])) / 2;
@@ -1465,6 +1918,15 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     d_moe_tile_e_ = gpu_alloc(max_moe_tiles * sizeof(int32_t));
     d_moe_inter_ = gpu_alloc(max_moe_tiles * 16 * 640 * sizeof(uint16_t));
     d_moe_y_ = gpu_alloc(B * 16 * 2560 * sizeof(uint16_t));
+
+    d_mtp_r_ring_ = gpu_alloc(static_cast<size_t>(kMtpRingCap) * 10240 * sizeof(uint16_t), true);
+    d_mtp_r_state_ = gpu_alloc(10240 * sizeof(uint16_t), true);
+    d_mtp_emb_norm_ = gpu_alloc(B * 2560 * sizeof(uint16_t));
+    d_mtp_e2_ = gpu_alloc(B * 2560 * sizeof(uint16_t));
+    d_mtp_h_norm_ = gpu_alloc(B * 10240 * sizeof(uint16_t));
+    d_mtp_h2_ = gpu_alloc(B * 10240 * sizeof(uint16_t));
+    d_argmax_summary_ = gpu_alloc(4 * sizeof(strata::kernels::Nvfp4ArgmaxSummary));
+    d_moe_gpu_align_ids_ = gpu_alloc(B * 10 * sizeof(int32_t));
 }
 
 void Qwen4ExpGfx1201Engine::populate_rope_range(int32_t p_begin, int32_t p_end) {
@@ -1665,7 +2127,7 @@ void Qwen4ExpGfx1201Engine::ensure_context_capacity(int32_t needed_seq) {
         if (want_kv_bytes > vram_kv_mapped_bytes_) {
             size_t add_kv = want_kv_bytes - vram_kv_mapped_bytes_;
             uint8_t* vbase = kv_vmm_range_.base();
-            for (int q = 0; q < 12; ++q) {
+            for (int q = 0; q < kNumQsaCaches; ++q) {
                 size_t k_off = static_cast<size_t>(q) * 2 * vram_kv_stride_bytes_ + vram_kv_mapped_bytes_;
                 size_t v_off = static_cast<size_t>(q) * 2 * vram_kv_stride_bytes_ + vram_kv_stride_bytes_ + vram_kv_mapped_bytes_;
                 if (!map_kv_vmm_with_reclaim(k_off, add_kv) || !map_kv_vmm_with_reclaim(v_off, add_kv)) {
@@ -1684,8 +2146,9 @@ void Qwen4ExpGfx1201Engine::ensure_context_capacity(int32_t needed_seq) {
         if (want_bk_bytes > vram_bk_mapped_bytes_) {
             size_t add_bk = want_bk_bytes - vram_bk_mapped_bytes_;
             uint8_t* vbase = kv_vmm_range_.base();
-            for (int q = 0; q < 12; ++q) {
-                size_t b_off = 24ULL * vram_kv_stride_bytes_ + static_cast<size_t>(q) * vram_bk_stride_bytes_ + vram_bk_mapped_bytes_;
+            for (int q = 0; q < kNumQsaCaches; ++q) {
+                size_t b_off = 2ULL * static_cast<size_t>(kNumQsaCaches) * vram_kv_stride_bytes_ +
+                               static_cast<size_t>(q) * vram_bk_stride_bytes_ + vram_bk_mapped_bytes_;
                 if (!map_kv_vmm_with_reclaim(b_off, add_bk)) {
                     std::fprintf(stderr, "[gfx1201-nvfp4] Failed to grow VRAM Block-K VmmRange to %zu bytes\n", want_bk_bytes);
                     std::exit(1);
@@ -1702,7 +2165,7 @@ void Qwen4ExpGfx1201Engine::ensure_context_capacity(int32_t needed_seq) {
         want_hkv_bytes = std::min(want_hkv_bytes, host_kv_stride_bytes_);
         if (want_hkv_bytes > host_kv_mapped_bytes_) {
             size_t add_hkv = want_hkv_bytes - host_kv_mapped_bytes_;
-            for (int q = 0; q < 12; ++q) {
+            for (int q = 0; q < kNumQsaCaches; ++q) {
                 uint8_t* hk = host_kv_mmap_ + static_cast<size_t>(2 * q) * host_kv_stride_bytes_ + host_kv_mapped_bytes_;
                 uint8_t* hv = host_kv_mmap_ + static_cast<size_t>(2 * q + 1) * host_kv_stride_bytes_ + host_kv_mapped_bytes_;
                 (void) ::madvise(hk, add_hkv, MADV_HUGEPAGE);
@@ -1723,7 +2186,7 @@ void Qwen4ExpGfx1201Engine::ensure_context_capacity(int32_t needed_seq) {
         want_hbk_bytes = std::min(want_hbk_bytes, host_bk_stride_bytes_);
         if (want_hbk_bytes > host_bk_mapped_bytes_) {
             size_t add_hbk = want_hbk_bytes - host_bk_mapped_bytes_;
-            for (int q = 0; q < 12; ++q) {
+            for (int q = 0; q < kNumQsaCaches; ++q) {
                 uint8_t* hb = host_bk_mmap_ + static_cast<size_t>(q) * host_bk_stride_bytes_ + host_bk_mapped_bytes_;
                 (void) ::madvise(hb, add_hbk, MADV_HUGEPAGE);
                 std::memset(hb, 0, add_hbk);
@@ -1905,6 +2368,45 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
             63ULL * 2560 * sizeof(uint16_t));
         lw.moe.sh_down = load_vram_tensor(mpfx + ".shared_expert.down_proj.weight");
     }
+
+    const bool want_mtp = (std::getenv("STRATA_DISABLE_MTP") == nullptr) &&
+                          (main_index.count("mtp.fc_embedding.weight") > 0) &&
+                          (main_index.count("mtp.layers.0.mlp.experts.0.gate_proj.weight") > 0);
+    if (const char* env_hn = std::getenv("STRATA_MTP_HNORM_STREAM")) {
+        mtp_hnorm_per_stream_ = (std::atoi(env_hn) != 0);
+    }
+    if (want_mtp) {
+        mtp_.pre_fc_norm_embedding = load_vram_tensor("mtp.pre_fc_norm_embedding.weight");
+        mtp_.pre_fc_norm_hidden = load_vram_tensor("mtp.pre_fc_norm_hidden.weight");
+        mtp_.fc_embedding = load_vram_tensor("mtp.fc_embedding.weight");
+        mtp_.fc_hidden = load_vram_tensor("mtp.fc_hidden.weight");
+        mtp_.attn_hc = load_hc("mtp.layers.0.attn_hyper_connection", true);
+        std::string apfx = "mtp.layers.0.self_attn";
+        mtp_.qsa.in_proj_fused = load_vram_tensor_concat({
+            apfx + ".q_proj.weight",
+            apfx + ".k_proj.weight",
+            apfx + ".v_proj.weight",
+            apfx + ".indexer.index_qk_proj.weight",
+        });
+        mtp_.qsa.o_proj = load_vram_tensor(apfx + ".o_proj.weight");
+        mtp_.qsa.q_norm = load_vram_tensor(apfx + ".q_norm.weight");
+        mtp_.qsa.k_norm = load_vram_tensor(apfx + ".k_norm.weight");
+        mtp_.qsa.idx_q_ln = load_vram_tensor(apfx + ".indexer.q_layernorm.weight");
+        mtp_.qsa.idx_k_ln = load_vram_tensor(apfx + ".indexer.k_layernorm.weight");
+        mtp_.mlp_hc = load_hc("mtp.layers.0.mlp_hyper_connection", true);
+        std::string mpfx = "mtp.layers.0.mlp";
+        mtp_.moe.in_proj_fused = load_vram_tensor_concat(
+            {
+                mpfx + ".shared_expert.gate_proj.weight",
+                mpfx + ".shared_expert.up_proj.weight",
+                mpfx + ".gate.weight",
+                mpfx + ".shared_expert_gate.weight",
+            },
+            63ULL * 2560 * sizeof(uint16_t));
+        mtp_.moe.sh_down = load_vram_tensor(mpfx + ".shared_expert.down_proj.weight");
+        mtp_.final_hc = load_hc("mtp.hyper_connection_mixer", false);
+    }
+
     for (int s = 0; s < 10; ++s) {
         (void) ::posix_fadvise(shard_fds[s], 0, 0, POSIX_FADV_DONTNEED);
     }
@@ -2301,6 +2803,112 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
                             lw.moe.h_ptrs_prefill.size() * sizeof(int64_t), hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(lw.moe.d_s2, lw.moe.h_s2.data(), lw.moe.h_s2.size() * sizeof(float),
                             hipMemcpyHostToDevice));
+    }
+
+    if (want_mtp) {
+        using strata::kernels::MTP_EXP_S_BYTES;
+        using strata::kernels::MTP_EXP_STRIDE_BYTES;
+        using strata::kernels::MTP_EXP_W_BYTES;
+        using strata::kernels::MTP_OFF_DOWN_S;
+        using strata::kernels::MTP_OFF_DOWN_W;
+        using strata::kernels::MTP_OFF_GATE_S;
+        using strata::kernels::MTP_OFF_GATE_W;
+        using strata::kernels::MTP_OFF_UP_S;
+        using strata::kernels::MTP_OFF_UP_W;
+
+        const size_t total_mtp_exp_bytes = 512ULL * MTP_EXP_STRIDE_BYTES;
+        void* hptr = nullptr;
+        if (::posix_memalign(&hptr, 2 * 1024 * 1024, total_mtp_exp_bytes) != 0 || !hptr) {
+            std::fprintf(stderr, "posix_memalign failed for %zu MB MTP FP8 expert host arena\n",
+                         total_mtp_exp_bytes / (1024 * 1024));
+            std::exit(1);
+        }
+        (void) ::madvise(hptr, total_mtp_exp_bytes, MADV_HUGEPAGE);
+        uint8_t* mtp_host_base = static_cast<uint8_t*>(hptr);
+        prefault_hugepages(mtp_host_base, total_mtp_exp_bytes);
+
+        struct MtpExpSlice6 {
+            TensorSlice gw, gs, uw, us, dw, ds;
+        };
+        std::vector<MtpExpSlice6> mtp_slices(512);
+        int sorted_e[512];
+        for (int e = 0; e < 512; ++e) {
+            std::string epfx = "mtp.layers.0.mlp.experts." + std::to_string(e) + ".";
+            mtp_slices[e] = MtpExpSlice6{
+                main_index.at(epfx + "gate_proj.weight"),
+                main_index.at(epfx + "gate_proj.weight_scale_inv"),
+                main_index.at(epfx + "up_proj.weight"),
+                main_index.at(epfx + "up_proj.weight_scale_inv"),
+                main_index.at(epfx + "down_proj.weight"),
+                main_index.at(epfx + "down_proj.weight_scale_inv"),
+            };
+            sorted_e[e] = e;
+        }
+        std::sort(sorted_e, sorted_e + 512, [&](int a, int b) {
+            const auto& da = mtp_slices[a].dw;
+            const auto& db = mtp_slices[b].dw;
+            return (da.shard_idx != db.shard_idx) ? (da.shard_idx < db.shard_idx)
+                                                  : (da.file_offset < db.file_offset);
+        });
+
+        std::vector<std::thread> io_workers;
+        io_workers.reserve(n_io_threads - 1);
+        auto load_mtp_chunk = [&](int tid) {
+            int idx_begin = (tid * 512) / n_io_threads;
+            int idx_end = ((tid + 1) * 512) / n_io_threads;
+            for (int idx = idx_begin; idx < idx_end; ++idx) {
+                int e = sorted_e[idx];
+                const MtpExpSlice6& es = mtp_slices[e];
+                uint8_t* dst = mtp_host_base + static_cast<size_t>(e) * MTP_EXP_STRIDE_BYTES;
+                pread_exact(shard_fds[es.gs.shard_idx], dst + MTP_OFF_GATE_S, MTP_EXP_S_BYTES, es.gs.file_offset);
+                pread_exact(shard_fds[es.us.shard_idx], dst + MTP_OFF_UP_S, MTP_EXP_S_BYTES, es.us.file_offset);
+                pread_exact(shard_fds[es.ds.shard_idx], dst + MTP_OFF_DOWN_S, MTP_EXP_S_BYTES, es.ds.file_offset);
+                pread_exact(shard_fds[es.gw.shard_idx], dst + MTP_OFF_GATE_W, MTP_EXP_W_BYTES, es.gw.file_offset);
+                pread_exact(shard_fds[es.uw.shard_idx], dst + MTP_OFF_UP_W, MTP_EXP_W_BYTES, es.uw.file_offset);
+                pread_exact(shard_fds[es.dw.shard_idx], dst + MTP_OFF_DOWN_W, MTP_EXP_W_BYTES, es.dw.file_offset);
+            }
+        };
+        for (int t = 1; t < n_io_threads; ++t) {
+            io_workers.emplace_back(load_mtp_chunk, t);
+        }
+        load_mtp_chunk(0);
+        for (auto& w : io_workers) w.join();
+
+        for (int fd : shard_fds) {
+            (void) ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        }
+
+        HIP_CHECK(hipHostRegister(mtp_host_base, total_mtp_exp_bytes, hipHostRegisterMapped));
+        host_registered_.push_back(mtp_host_base);
+        void* dptr = nullptr;
+        HIP_CHECK(hipHostGetDevicePointer(&dptr, mtp_host_base, 0));
+        uint8_t* mtp_host_dev = static_cast<uint8_t*>(dptr);
+
+        mtp_.moe.h_ptrs.assign(512 * 6, 0);
+        mtp_.moe.h_ptrs_prefill.assign(512 * 6, 0);
+        for (int e = 0; e < 512; ++e) {
+            mtp_.moe.in_vram[e] = false;
+            mtp_.moe.in_gpu_cold[e] = true;
+            mtp_.moe.host_cpu_ptr[e] = mtp_host_base + static_cast<size_t>(e) * MTP_EXP_STRIDE_BYTES;
+            uint8_t* edev = mtp_host_dev + static_cast<size_t>(e) * MTP_EXP_STRIDE_BYTES;
+            mtp_.moe.host_dev_ptr[e] = edev;
+            mtp_.moe.h_ptrs[e * 6 + 0] = reinterpret_cast<int64_t>(edev + MTP_OFF_GATE_W);
+            mtp_.moe.h_ptrs[e * 6 + 1] = reinterpret_cast<int64_t>(edev + MTP_OFF_GATE_S);
+            mtp_.moe.h_ptrs[e * 6 + 2] = reinterpret_cast<int64_t>(edev + MTP_OFF_UP_W);
+            mtp_.moe.h_ptrs[e * 6 + 3] = reinterpret_cast<int64_t>(edev + MTP_OFF_UP_S);
+            mtp_.moe.h_ptrs[e * 6 + 4] = reinterpret_cast<int64_t>(edev + MTP_OFF_DOWN_W);
+            mtp_.moe.h_ptrs[e * 6 + 5] = reinterpret_cast<int64_t>(edev + MTP_OFF_DOWN_S);
+        }
+        mtp_.moe.d_ptrs = gpu_alloc(mtp_.moe.h_ptrs.size() * sizeof(int64_t));
+        mtp_.moe.d_ptrs_prefill = gpu_alloc(mtp_.moe.h_ptrs_prefill.size() * sizeof(int64_t), true);
+        HIP_CHECK(hipMemcpy(mtp_.moe.d_ptrs, mtp_.moe.h_ptrs.data(), mtp_.moe.h_ptrs.size() * sizeof(int64_t),
+                            hipMemcpyHostToDevice));
+        mtp_.available = true;
+        FILE* log_fp = serve_mode_ ? stderr : stdout;
+        std::fprintf(log_fp,
+                     "[gfx1201-nvfp4] Loaded native MTP draft layer (BF16 dense + 512 FP8 experts in %.2f GiB mapped hugepage RAM)\n",
+                     static_cast<double>(total_mtp_exp_bytes) / (1024.0 * 1024.0 * 1024.0));
+        std::fflush(log_fp);
     }
 
     for (size_t s = 0; s < shard_fds.size(); ++s) {

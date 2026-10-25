@@ -250,6 +250,16 @@ int run_nvfp4(int argc, char** argv) {
     std::vector<int32_t> history;
     int32_t next_tok = -1;
     strata::spec::Nvfp4NgramDrafter drafter(tokenizer);
+    float mtp_min_prob = 0.35f;
+    if (const char* emp = std::getenv("STRATA_MTP_MIN_PROB")) {
+        mtp_min_prob = std::clamp(static_cast<float>(std::atof(emp)), 0.0f, 1.0f);
+    }
+    int32_t mtp_max_k = 2;
+    if (const char* emk = std::getenv("STRATA_MTP_K")) {
+        mtp_max_k = std::clamp(std::atoi(emk), 0, 3);
+    }
+    const bool mtp_only = (std::getenv("STRATA_MTP_ONLY") != nullptr &&
+                           std::atoi(std::getenv("STRATA_MTP_ONLY")) != 0);
 
     if (serve_mode) {
         std::printf("INFO kv_resident=%d expert_slots=%d vram_reserve_mib=%d batch_slots=0 engine=gfx1201-nvfp4\n",
@@ -428,6 +438,9 @@ int run_nvfp4(int argc, char** argv) {
                                                          static_cast<int32_t>(chunk), static_cast<int32_t>(i),
                                                          is_last, nullptr, nullptr,
                                                          &req_sp, &history, &req_rng);
+                    if (spec_ngram > 0 && engine.has_mtp()) {
+                        engine.mtp_catchup_kv(history, static_cast<int32_t>(history.size()) - 1);
+                    }
                     i += chunk;
                     double pf_ms_so_far = std::chrono::duration<double, std::milli>(
                                               std::chrono::steady_clock::now() - t_pf0)
@@ -480,10 +493,19 @@ int run_nvfp4(int argc, char** argv) {
                     }
 
                     std::vector<int32_t> draft;
-                    if (req_sp.is_greedy()) {
-                        drafter.draft(next_tok, N, history, spec_ngram, draft);
-                    }
+                    bool used_mtp = false;
                     int max_rem = req_max_new - step - 1;
+                    int32_t eff_k = std::min<int32_t>(mtp_max_k, std::max(0, max_rem));
+                    if (req_sp.is_greedy() && spec_ngram && max_rem > 0) {
+                        drafter.observe_target_confidence(engine.last_target_prob(), engine.last_target_margin());
+                        if (!mtp_only) {
+                            drafter.draft(next_tok, N, history, spec_ngram, draft);
+                        }
+                        if (engine.has_mtp() && eff_k > 0 && static_cast<int32_t>(draft.size()) < std::min<int32_t>(2, eff_k)) {
+                            engine.draft_mtp(next_tok, history, eff_k, mtp_min_prob, draft);
+                            used_mtp = !draft.empty();
+                        }
+                    }
                     if (static_cast<int>(draft.size()) > max_rem) {
                         draft.resize(std::max(0, max_rem));
                     }
@@ -516,13 +538,17 @@ int run_nvfp4(int argc, char** argv) {
                         double ver_ms = std::chrono::duration<double, std::milli>(
                                             std::chrono::steady_clock::now() - t_ver0)
                                             .count();
-                        drafter.observe_step(K, accepted, ver_ms);
+                        if (!used_mtp) {
+                            drafter.observe_step(K, accepted, ver_ms);
+                        }
 
                         if (accepted < K) {
-                            int32_t prev_t = b_toks[accepted];
-                            int32_t prev2_t = b_p1[accepted];
-                            int32_t bad_cand = draft[accepted];
-                            drafter.record_rejection(prev2_t, prev_t, bad_cand);
+                            if (!used_mtp) {
+                                int32_t prev_t = b_toks[accepted];
+                                int32_t prev2_t = b_p1[accepted];
+                                int32_t bad_cand = draft[accepted];
+                                drafter.record_rejection(prev2_t, prev_t, bad_cand);
+                            }
                             history.resize(static_cast<size_t>(pos0 + n_adv));
                         }
                         bool hit_eos = false;
@@ -593,6 +619,9 @@ int run_nvfp4(int argc, char** argv) {
                                              static_cast<int32_t>(chunk), static_cast<int32_t>(i), is_last,
                                              (is_last && !dump_logits_path.empty()) ? &dumped_logits : nullptr,
                                              nullptr, &cli_sp, &history, &cli_rng);
+        if (spec_ngram > 0 && engine.has_mtp()) {
+            engine.mtp_catchup_kv(history, static_cast<int32_t>(history.size()) - 1);
+        }
         i += chunk;
     }
     double prefill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_prefill_start).count();
@@ -633,10 +662,19 @@ int run_nvfp4(int argc, char** argv) {
         if (next_tok == 248044 || next_tok == 248046 || step >= max_new_tokens) break;
 
         std::vector<int32_t> draft;
-        if (cli_sp.is_greedy()) {
-            drafter.draft(next_tok, total_prompt, history, spec_ngram, draft);
-        }
+        bool used_mtp = false;
         int max_rem = max_new_tokens - step - 1;
+        int32_t eff_k = std::min<int32_t>(mtp_max_k, std::max(0, max_rem));
+        if (cli_sp.is_greedy() && spec_ngram && max_rem > 0) {
+            drafter.observe_target_confidence(engine.last_target_prob(), engine.last_target_margin());
+            if (!mtp_only) {
+                drafter.draft(next_tok, total_prompt, history, spec_ngram, draft);
+            }
+            if (engine.has_mtp() && eff_k > 0 && static_cast<int32_t>(draft.size()) < std::min<int32_t>(2, eff_k)) {
+                engine.draft_mtp(next_tok, history, eff_k, mtp_min_prob, draft);
+                used_mtp = !draft.empty();
+            }
+        }
         if (static_cast<int>(draft.size()) > max_rem) {
             draft.resize(std::max(0, max_rem));
         }
@@ -669,14 +707,18 @@ int run_nvfp4(int argc, char** argv) {
             double ver_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - t_ver0)
                                 .count();
-            drafter.observe_step(K, accepted, ver_ms);
+            if (!used_mtp) {
+                drafter.observe_step(K, accepted, ver_ms);
+            }
 
             if (accepted < K) {
                 // Record rejected transition so it is never re-drafted in this context
-                int32_t prev_t = b_toks[accepted];
-                int32_t prev2_t = b_p1[accepted];
-                int32_t bad_cand = draft[accepted];
-                drafter.record_rejection(prev2_t, prev_t, bad_cand);
+                if (!used_mtp) {
+                    int32_t prev_t = b_toks[accepted];
+                    int32_t prev2_t = b_p1[accepted];
+                    int32_t bad_cand = draft[accepted];
+                    drafter.record_rejection(prev2_t, prev_t, bad_cand);
+                }
                 history.resize(static_cast<size_t>(pos0 + n_adv));
             }
             for (int32_t j = 0; j < accepted; ++j) {
