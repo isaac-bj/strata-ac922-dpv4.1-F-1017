@@ -522,6 +522,158 @@ __global__ void nvfp4_moe_cap_gpu_cold_k(int32_t* __restrict__ cur_ids,
     }
 }
 
+__global__ __launch_bounds__(256) void nvfp4_mtp_dvocab_gemv_k(
+    const uint16_t* __restrict__ x_bf16,
+    const uint16_t* __restrict__ lm_head_bf16,
+    const int32_t* __restrict__ dvocab,
+    uint16_t* __restrict__ logits_out_bf16,
+    int32_t n_dvocab) {
+    __shared__ uint4 s_x4[320]; // 2560 BF16 = 320 uint4 (5120 B)
+    const int tid = static_cast<int>(threadIdx.x);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x_bf16);
+    for (int i = tid; i < 320; i += 256) {
+        s_x4[i] = x4[i];
+    }
+    __syncthreads();
+
+    const int wid = tid >> 5;   // 0..7 (8 rows per 256-thread block)
+    const int lane = tid & 31;  // 0..31
+    const int32_t row_idx = static_cast<int32_t>(blockIdx.x) * 8 + wid;
+    if (row_idx >= n_dvocab) return;
+
+    const int32_t tok_id = dvocab[row_idx];
+    const uint4* w_row4 = reinterpret_cast<const uint4*>(
+        lm_head_bf16 + static_cast<size_t>(tok_id) * 2560ULL);
+
+    float acc = 0.0f;
+#pragma unroll
+    for (int step = 0; step < 10; ++step) {
+        const int idx4 = step * 32 + lane;
+        uint4 wv = w_row4[idx4];
+        uint4 xv = s_x4[idx4];
+        const uint16_t* wu = reinterpret_cast<const uint16_t*>(&wv);
+        const uint16_t* xu = reinterpret_cast<const uint16_t*>(&xv);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            acc += bf16_to_f32(wu[k]) * bf16_to_f32(xu[k]);
+        }
+    }
+
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        logits_out_bf16[row_idx] = f32_to_bf16(acc);
+    }
+}
+
+__global__ __launch_bounds__(1024) void nvfp4_argmax_prob_margin_dvocab_k(
+    const uint16_t* __restrict__ logits_bf16,
+    const int32_t* __restrict__ dvocab,
+    int32_t n_dvocab,
+    int32_t* __restrict__ out_tok,
+    Nvfp4ArgmaxSummary* __restrict__ out_summary) {
+    const int32_t tid = static_cast<int32_t>(threadIdx.x);
+
+    float m1 = -1e30f;
+    int32_t id1 = 0;
+    float m2 = -1e30f;
+    float s = 0.0f;
+
+    for (int32_t idx = tid; idx < n_dvocab; idx += 1024) {
+        float v = bf16_to_f32(logits_bf16[idx]);
+        if (v > m1) {
+            m2 = m1;
+            s = s * __expf(m1 - v) + 1.0f;
+            m1 = v;
+            id1 = idx;
+        } else {
+            if (v > m2) m2 = v;
+            s += __expf(v - m1);
+        }
+    }
+
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        float om1 = __shfl_xor_sync(0xffffffffu, m1, mask, 32);
+        int32_t oid1 = __shfl_xor_sync(0xffffffffu, id1, mask, 32);
+        float om2 = __shfl_xor_sync(0xffffffffu, m2, mask, 32);
+        float os = __shfl_xor_sync(0xffffffffu, s, mask, 32);
+        merge_online_top2_softmax(m1, id1, m2, s, om1, oid1, om2, os);
+    }
+
+    __shared__ float sm1[32];
+    __shared__ int32_t sid1[32];
+    __shared__ float sm2[32];
+    __shared__ float ss[32];
+
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    if (lane == 0) {
+        sm1[wid] = m1;
+        sid1[wid] = id1;
+        sm2[wid] = m2;
+        ss[wid] = s;
+    }
+    __syncthreads();
+
+    if (wid == 0) {
+        m1 = sm1[lane];
+        id1 = sid1[lane];
+        m2 = sm2[lane];
+        s = ss[lane];
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            float om1 = __shfl_xor_sync(0xffffffffu, m1, mask, 32);
+            int32_t oid1 = __shfl_xor_sync(0xffffffffu, id1, mask, 32);
+            float om2 = __shfl_xor_sync(0xffffffffu, m2, mask, 32);
+            float os = __shfl_xor_sync(0xffffffffu, s, mask, 32);
+            merge_online_top2_softmax(m1, id1, m2, s, om1, oid1, om2, os);
+        }
+        if (lane == 0) {
+            int32_t true_tok = (id1 >= 0 && id1 < n_dvocab) ? dvocab[id1] : id1;
+            if (out_tok) out_tok[0] = true_tok;
+            if (out_summary) {
+                out_summary[0].tok_id = true_tok;
+                out_summary[0].prob = 1.0f / fmaxf(s, 1.0f);
+                out_summary[0].margin = fmaxf(0.0f, m1 - m2);
+            }
+        }
+    }
+}
+
+__global__ void nvfp4_mtp_topk_truncate_k(int32_t* __restrict__ cur_ids,
+                                          float* __restrict__ cur_wts,
+                                          int32_t keep_k) {
+    const int lane = static_cast<int>(threadIdx.x);
+    if (lane >= 32) return;
+    int32_t my_id = (lane < 10) ? cur_ids[lane] : -1;
+    float my_w = (lane < 10 && my_id >= 0) ? cur_wts[lane] : -1.0f;
+
+    // Compute rank of each of the 10 experts by weight descending
+    int rank = 0;
+#pragma unroll
+    for (int j = 0; j < 10; ++j) {
+        float wj = __shfl_sync(0xffffffffu, my_w, j, 32);
+        if (wj > my_w || (wj == my_w && j < lane)) {
+            rank++;
+        }
+    }
+
+    float orig_w = (lane < 10 && my_w > 0.0f) ? my_w : 0.0f;
+    float kept_w = (lane < 10 && rank < keep_k && my_w > 0.0f) ? my_w : 0.0f;
+    float sum_orig = warp_sum(orig_w);
+    float sum_kept = warp_sum(kept_w);
+
+    if (lane < 10) {
+        if (rank < keep_k && my_id >= 0) {
+            float scale = (sum_kept > 1e-8f) ? (sum_orig / sum_kept) : 1.0f;
+            cur_wts[lane] = my_w * scale;
+        } else {
+            cur_ids[lane] = -1;
+            cur_wts[lane] = 0.0f;
+        }
+    }
+}
+
 }  // namespace
 
 void launch_nvfp4_mtp_ring_write(const void* src_x_bf16, void* dst_ring_bf16, int32_t pos0, int32_t ring_mask,
@@ -628,6 +780,33 @@ void launch_nvfp4_moe_cap_gpu_cold(int32_t* d_cur_ids, int32_t* d_gpu_align_ids,
     if (pairs <= 0) return;
     nvfp4_moe_cap_gpu_cold_k<<<1, 32, 0, stream>>>(
         d_cur_ids, d_gpu_align_ids, d_ptrs_decode, d_ptrs_vram, pairs, max_gpu_cold);
+}
+
+void launch_nvfp4_mtp_dvocab_gemv(const void* d_x_bf16, const void* d_lm_head_bf16, const int32_t* d_dvocab,
+                                  void* d_logits_out_bf16, int32_t n_dvocab, hipStream_t stream) {
+    if (n_dvocab <= 0) return;
+    uint32_t blocks = static_cast<uint32_t>((n_dvocab + 7) / 8);
+    nvfp4_mtp_dvocab_gemv_k<<<blocks, 256, 0, stream>>>(
+        static_cast<const uint16_t*>(d_x_bf16),
+        static_cast<const uint16_t*>(d_lm_head_bf16),
+        d_dvocab,
+        static_cast<uint16_t*>(d_logits_out_bf16),
+        n_dvocab);
+}
+
+void launch_nvfp4_argmax_prob_margin_dvocab(const void* d_logits_bf16, const int32_t* d_dvocab, int32_t n_dvocab,
+                                            int32_t* d_out_tok, Nvfp4ArgmaxSummary* d_out_summary,
+                                            hipStream_t stream) {
+    if (n_dvocab <= 0) return;
+    nvfp4_argmax_prob_margin_dvocab_k<<<1, 1024, 0, stream>>>(
+        static_cast<const uint16_t*>(d_logits_bf16),
+        d_dvocab, n_dvocab, d_out_tok, d_out_summary);
+}
+
+void launch_nvfp4_mtp_topk_truncate(int32_t* d_cur_ids, float* d_cur_wts, int32_t keep_k,
+                                    hipStream_t stream) {
+    if (keep_k <= 0 || keep_k >= 10) return;
+    nvfp4_mtp_topk_truncate_k<<<1, 32, 0, stream>>>(d_cur_ids, d_cur_wts, keep_k);
 }
 
 }  // namespace strata::kernels

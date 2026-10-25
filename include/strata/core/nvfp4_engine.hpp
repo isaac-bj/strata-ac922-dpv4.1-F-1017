@@ -143,7 +143,8 @@ public:
                                int32_t* verify_next_toks_out = nullptr,
                                const Nvfp4SamplingParams* sp = nullptr,
                                const std::vector<int32_t>* history = nullptr,
-                               std::mt19937_64* rng = nullptr);
+                               std::mt19937_64* rng = nullptr,
+                               const int32_t* verify_draft_toks = nullptr);
 
     void save_recurrent_ckpt();
     void restore_recurrent_ckpt();
@@ -175,11 +176,22 @@ private:
     int32_t sample_from_device_logits(const Nvfp4SamplingParams& sp,
                                       const std::vector<int32_t>* history,
                                       std::mt19937_64& rng);
+    int32_t sample_row_from_host_bf16_logits(const uint16_t* h_bf_row,
+                                             const Nvfp4SamplingParams& sp,
+                                             const std::vector<int32_t>* history,
+                                             size_t hist_len,
+                                             std::mt19937_64& rng,
+                                             int32_t draft_tok = -1,
+                                             float* out_prob = nullptr,
+                                             float* out_margin = nullptr);
+    void fetch_ple_rows_cached(const int32_t* tokens, const int32_t* prev0s, const int32_t* prev1s,
+                               int32_t M, uint8_t* h_ple_dst);
     int32_t run_cpu_moe_layer(int l, int32_t M, bool is_prefill, bool use_gpu_cold_cap = false);
     int32_t run_mtp_cpu_moe_decode();
     void run_mtp_kv_batch(const int32_t* next_toks, int32_t cell0, int32_t M);
     int32_t run_mtp_step_token(int32_t next_tok, int32_t cell, bool from_ring,
-                               float* prob_out = nullptr, float* margin_out = nullptr);
+                               float* prob_out = nullptr, float* margin_out = nullptr,
+                               int32_t ple_prev0 = -2, int32_t ple_prev1 = -2);
     void adapt_vram_experts(const int32_t* routed_ids, int32_t M, uint32_t min_hits, int max_swaps,
                             int32_t valid_toks = -1);
     void* gpu_alloc(size_t bytes, bool zero = false);
@@ -261,6 +273,7 @@ private:
     Nvfp4LayerWeights layers_[48];
     Nvfp4MtpWeights mtp_;
     bool mtp_hnorm_per_stream_ = false;
+    int32_t mtp_topk_ = 6;
     int32_t mtp_kv_pos_ = 0;
     int32_t turn_ckpt_mtp_kv_pos_ = 0;
     float last_target_prob_ = 1.0f;
@@ -272,9 +285,20 @@ private:
     void* d_mtp_e2_ = nullptr;
     void* d_mtp_h_norm_ = nullptr;
     void* d_mtp_h2_ = nullptr;
+    void* d_mtp_dvocab_ = nullptr;
+    int32_t n_mtp_dvocab_ = 0;
+    std::vector<int32_t> h_mtp_dvocab_;
+    std::vector<uint8_t> mtp_in_dvocab_;
     void* d_argmax_summary_ = nullptr;
     void* d_moe_gpu_align_ids_ = nullptr;
     alignas(64) float mtp_act_f32_[2560];
+
+    static constexpr size_t kPleCacheSlots = 4096;
+    struct PleCacheEntry {
+        uint64_t off = ~0ULL;
+        uint8_t data[160];
+    };
+    std::vector<PleCacheEntry> ple_cache_;
 
     // State & Scratch
     hipEvent_t ev_mixed_ = nullptr;

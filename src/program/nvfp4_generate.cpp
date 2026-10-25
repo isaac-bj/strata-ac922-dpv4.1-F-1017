@@ -496,7 +496,7 @@ int run_nvfp4(int argc, char** argv) {
                     bool used_mtp = false;
                     int max_rem = req_max_new - step - 1;
                     int32_t eff_k = std::min<int32_t>(mtp_max_k, std::max(0, max_rem));
-                    if (req_sp.is_greedy() && spec_ngram && max_rem > 0) {
+                    if (spec_ngram && max_rem > 0) {
                         drafter.observe_target_confidence(engine.last_target_prob(), engine.last_target_margin());
                         if (!mtp_only) {
                             drafter.draft(next_tok, N, history, spec_ngram, draft);
@@ -526,7 +526,8 @@ int run_nvfp4(int argc, char** argv) {
                             b_p1[j] = (history.size() >= 1) ? history[history.size() - 1] : strata::kernels::TOKEN_NULL;
                             history.push_back(tk);
                         }
-                        (void) engine.step_prefill_batch(b_toks, b_p0, b_p1, M, pos0, true, nullptr, preds);
+                        (void) engine.step_prefill_batch(b_toks, b_p0, b_p1, M, pos0, true, nullptr, preds,
+                                                         &req_sp, &history, &req_rng, draft.data());
 
                         int32_t accepted = 0;
                         while (accepted < K && preds[accepted] == draft[accepted]) {
@@ -665,7 +666,7 @@ int run_nvfp4(int argc, char** argv) {
         bool used_mtp = false;
         int max_rem = max_new_tokens - step - 1;
         int32_t eff_k = std::min<int32_t>(mtp_max_k, std::max(0, max_rem));
-        if (cli_sp.is_greedy() && spec_ngram && max_rem > 0) {
+        if (spec_ngram && max_rem > 0) {
             drafter.observe_target_confidence(engine.last_target_prob(), engine.last_target_margin());
             if (!mtp_only) {
                 drafter.draft(next_tok, total_prompt, history, spec_ngram, draft);
@@ -695,7 +696,8 @@ int run_nvfp4(int argc, char** argv) {
                 b_p1[j] = (history.size() >= 1) ? history[history.size() - 1] : strata::kernels::TOKEN_NULL;
                 history.push_back(tk);
             }
-            (void) engine.step_prefill_batch(b_toks, b_p0, b_p1, M, pos0, true, nullptr, preds);
+            (void) engine.step_prefill_batch(b_toks, b_p0, b_p1, M, pos0, true, nullptr, preds,
+                                             &cli_sp, &history, &cli_rng, draft.data());
 
             int32_t accepted = 0;
             while (accepted < K && preds[accepted] == draft[accepted]) {

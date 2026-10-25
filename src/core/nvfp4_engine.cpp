@@ -346,20 +346,8 @@ int32_t Qwen4ExpGfx1201Engine::step_token(int32_t token_id, int32_t prev0, int32
             if (l == 20 && ev_prof_[7]) HIP_CHECK(hipEventRecord(ev_prof_[7], nullptr));
 
             if (l == 0) {
-                uint32_t rows16[16]{};
-                const int32_t prev_pair[2] = {prev0, prev1};
-                strata::kernels::ngram_rows(&token_id, prev_pair, 1, ple_consts_, rows16);
                 uint8_t* h_ple_rows = static_cast<uint8_t*>(h_step_meta_) + 16;
-                uint64_t ple_offs[16];
-                uint8_t* ple_dsts[16];
-                for (int h = 0; h < 16; ++h) {
-                    uint32_t r = rows16[h];
-                    uint32_t shard = r / 2500012u;
-                    uint32_t row_in_shard = r % 2500012u;
-                    ple_offs[h] = ple_.shard_offsets[shard] + static_cast<uint64_t>(row_in_shard) * 160ULL;
-                    ple_dsts[h] = h_ple_rows + h * 160;
-                }
-                cpu_pool_.run_ple_reads(ple_.ple_fd, ple_offs, ple_dsts, 16);
+                fetch_ple_rows_cached(&token_id, &prev0, &prev1, 1, h_ple_rows);
             }
 
             int32_t has_cpu = run_cpu_moe_layer(l, 1, /*is_prefill=*/false);
@@ -477,7 +465,8 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                                                   int32_t* verify_next_toks_out,
                                                   const Nvfp4SamplingParams* sp,
                                                   const std::vector<int32_t>* history,
-                                                  std::mt19937_64* rng) {
+                                                  std::mt19937_64* rng,
+                                                  const int32_t* verify_draft_toks) {
     if (M == 1 && !verify_next_toks_out) {
         return step_token(tokens[0], prev0s[0], prev1s[0], pos0, compute_logits, dump_logits_out, sp, history, rng);
     }
@@ -729,6 +718,17 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                                      hipMemcpyDeviceToHost, nullptr));
             HIP_CHECK(hipEventRecord(ev_route_, nullptr));
 
+            if (is_small_batch && !is_verify_batch) {
+                // Filter out non-VRAM experts into d_moe_gpu_align_ids_ after ev_route_ has fired
+                // so moe_align only creates 16-row WMMA tiles for VRAM-resident experts.
+                strata::kernels::launch_nvfp4_moe_cap_gpu_cold(
+                    static_cast<int32_t*>(d_cur_ids),
+                    static_cast<int32_t*>(d_moe_gpu_align_ids_),
+                    static_cast<const int64_t*>(lw.moe.d_ptrs),
+                    static_cast<const int64_t*>(lw.moe.d_ptrs_prefill),
+                    pairs, /*max_gpu_cold=*/0, nullptr);
+            }
+
             void* a_ex[] = {&d_proj_scratch_, &d_sh_gu_};
             kernels_.launch("moe_sh_gu_extract", 5, M, 1, a_ex);
             void* a_sm[] = {&d_sh_gu_, &d_sh_inter_, &M};
@@ -736,8 +736,8 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
             void* a_d[] = {&d_sh_inter_, &lw.moe.sh_down, &d_sh_out_, &M};
             kernels_.launch("bf16_linear_2560_640", 40, m_tiles16, 1, a_d);
 
-            int32_t max_tiles = (pairs + 15) / 16 + std::min(512, pairs);
-            void* align_ids = is_verify_batch ? d_moe_gpu_align_ids_ : d_cur_ids;
+            int32_t max_tiles = is_small_batch ? pairs : ((pairs + 15) / 16 + std::min(512, pairs));
+            void* align_ids = is_small_batch ? d_moe_gpu_align_ids_ : d_cur_ids;
             void* a_al[] = {&align_ids, &d_moe_sorted_, &d_moe_tile_e_, &pairs, &max_tiles};
             kernels_.launch("moe_align", 1, 1, 1, a_al);
 
@@ -750,46 +750,7 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
             kernels_.launch("moe_down", 10, max_tiles, 1, a_dn);
 
             if (l == 0) {
-                struct PleReq {
-                    uint64_t off;
-                    uint8_t* dst;
-                };
-                std::vector<PleReq> reqs(static_cast<size_t>(M) * 16);
-                for (int32_t t = 0; t < M; ++t) {
-                    uint32_t rows16[16]{};
-                    const int32_t prev_pair[2] = {prev0s[t], prev1s[t]};
-                    strata::kernels::ngram_rows(&tokens[t], prev_pair, 1, ple_consts_, rows16);
-                    uint8_t* dst_row = h_ple_rows + static_cast<size_t>(t) * 2560;
-                    for (int h = 0; h < 16; ++h) {
-                        uint32_t r = rows16[h];
-                        uint32_t shard = r / 2500012u;
-                        uint32_t row_in_shard = r % 2500012u;
-                        reqs[static_cast<size_t>(t) * 16 + h] = PleReq{
-                            ple_.shard_offsets[shard] + static_cast<uint64_t>(row_in_shard) * 160ULL,
-                            dst_row + h * 160,
-                        };
-                    }
-                }
-                std::sort(reqs.begin(), reqs.end(), [](const PleReq& a, const PleReq& b) {
-                    return a.off < b.off;
-                });
-                std::vector<uint64_t> uniq_offs;
-                std::vector<uint8_t*> uniq_dsts;
-                uniq_offs.reserve(reqs.size());
-                uniq_dsts.reserve(reqs.size());
-                for (size_t i = 0; i < reqs.size(); ++i) {
-                    if (i == 0 || reqs[i].off != reqs[i - 1].off) {
-                        uniq_offs.push_back(reqs[i].off);
-                        uniq_dsts.push_back(reqs[i].dst);
-                    }
-                }
-                cpu_pool_.run_ple_reads(ple_.ple_fd, uniq_offs.data(), uniq_dsts.data(),
-                                        static_cast<int>(uniq_offs.size()));
-                for (size_t i = 1; i < reqs.size(); ++i) {
-                    if (reqs[i].off == reqs[i - 1].off) {
-                        std::memcpy(reqs[i].dst, reqs[i - 1].dst, 160);
-                    }
-                }
+                fetch_ple_rows_cached(tokens, prev0s, prev1s, M, h_ple_rows);
             }
 
             (void) run_cpu_moe_layer(l, M, /*is_prefill=*/true, is_verify_batch);
@@ -827,16 +788,48 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
         kernels_.launch("hc_mix", 80, M, 1, m_args);
         void* a_lm[] = {&d_attn_out_, &d_lm_head_, &d_logits_bf16_, &M};
         kernels_.launch_default("bf16_gemv_m4_248320_2560", a_lm);
-        strata::kernels::launch_nvfp4_argmax_prob_margin_248320(
-            d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
-            static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), M, nullptr);
-        HIP_CHECK(hipMemcpy(verify_summaries_, d_argmax_summary_,
-                            static_cast<size_t>(M) * sizeof(strata::kernels::Nvfp4ArgmaxSummary),
-                            hipMemcpyDeviceToHost));
-        for (int32_t t = 0; t < M; ++t) {
-            verify_next_toks_out[t] = verify_summaries_[t].tok_id;
+
+        const bool use_ver_sampling = (sp && !sp->is_greedy() && rng);
+        if (!use_ver_sampling) {
+            strata::kernels::launch_nvfp4_argmax_prob_margin_248320(
+                d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
+                static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), M, nullptr);
+            HIP_CHECK(hipMemcpy(verify_summaries_, d_argmax_summary_,
+                                static_cast<size_t>(M) * sizeof(strata::kernels::Nvfp4ArgmaxSummary),
+                                hipMemcpyDeviceToHost));
+            for (int32_t t = 0; t < M; ++t) {
+                verify_next_toks_out[t] = verify_summaries_[t].tok_id;
+            }
+            return verify_next_toks_out[M - 1];
+        } else {
+            static constexpr size_t kVocab = 248320;
+            uint16_t* h_bf_all = static_cast<uint16_t*>(h_cpu_upload_);
+            HIP_CHECK(hipMemcpy(h_bf_all, d_logits_bf16_,
+                                static_cast<size_t>(M) * kVocab * sizeof(uint16_t),
+                                hipMemcpyDeviceToHost));
+            const size_t base_hist_len = (history && history->size() >= static_cast<size_t>(M))
+                                             ? (history->size() - static_cast<size_t>(M))
+                                             : 0;
+            for (int32_t t = 0; t < M; ++t) {
+                int32_t d_tok = (verify_draft_toks && t + 1 < M) ? verify_draft_toks[t] : -1;
+                float prob_t = 1.0f, margin_t = 0.0f;
+                int32_t sampled = sample_row_from_host_bf16_logits(
+                    h_bf_all + static_cast<size_t>(t) * kVocab, *sp, history,
+                    base_hist_len + static_cast<size_t>(t + 1), *rng, d_tok, &prob_t, &margin_t);
+                verify_next_toks_out[t] = sampled;
+                verify_summaries_[t].tok_id = sampled;
+                verify_summaries_[t].prob = prob_t;
+                verify_summaries_[t].margin = margin_t;
+                if (d_tok >= 0 && sampled != d_tok) {
+                    for (int32_t rem = t + 1; rem < M; ++rem) {
+                        verify_next_toks_out[rem] = sampled;
+                        verify_summaries_[rem] = verify_summaries_[t];
+                    }
+                    break;
+                }
+            }
+            return verify_next_toks_out[M - 1];
         }
-        return verify_next_toks_out[M - 1];
     }
 
     {
@@ -894,22 +887,76 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
     return next_id;
 }
 
-int32_t Qwen4ExpGfx1201Engine::sample_from_device_logits(const Nvfp4SamplingParams& sp,
-                                                         const std::vector<int32_t>* history,
-                                                         std::mt19937_64& rng) {
+void Qwen4ExpGfx1201Engine::fetch_ple_rows_cached(const int32_t* tokens, const int32_t* prev0s, const int32_t* prev1s,
+                                                  int32_t M, uint8_t* h_ple_dst) {
+    uint64_t miss_offs[kMaxBatch * 16];
+    uint8_t* miss_cache_dsts[kMaxBatch * 16];
+    uint8_t* miss_user_dsts[kMaxBatch * 16];
+    int n_miss = 0;
+
+    for (int32_t t = 0; t < M; ++t) {
+        uint8_t* dst_2560 = h_ple_dst ? (h_ple_dst + static_cast<size_t>(t) * 2560) : nullptr;
+        uint32_t rows16[16]{};
+        const int32_t prev_pair[2] = {prev0s[t], prev1s[t]};
+        strata::kernels::ngram_rows(&tokens[t], prev_pair, 1, ple_consts_, rows16);
+        for (int h = 0; h < 16; ++h) {
+            uint32_t r = rows16[h];
+            uint32_t shard = r / 2500012u;
+            uint32_t row_in_shard = r % 2500012u;
+            uint64_t off = ple_.shard_offsets[shard] + static_cast<uint64_t>(row_in_shard) * 160ULL;
+            uint8_t* user_dst = dst_2560 ? (dst_2560 + h * 160) : nullptr;
+            if (!ple_cache_.empty()) {
+                size_t slot = static_cast<size_t>(((off / 160ULL) * 0x9E3779B97F4A7C15ULL) >> 52) & (kPleCacheSlots - 1);
+                PleCacheEntry& ce = ple_cache_[slot];
+                if (ce.off == off) {
+                    if (user_dst) {
+                        std::memcpy(user_dst, ce.data, 160);
+                    }
+                    continue;
+                }
+                ce.off = off;
+                miss_offs[n_miss] = off;
+                miss_cache_dsts[n_miss] = ce.data;
+                miss_user_dsts[n_miss] = user_dst;
+                n_miss++;
+            } else if (user_dst) {
+                miss_offs[n_miss] = off;
+                miss_cache_dsts[n_miss] = user_dst;
+                miss_user_dsts[n_miss] = nullptr;
+                n_miss++;
+            }
+        }
+    }
+
+    if (n_miss > 0) {
+        cpu_pool_.run_ple_reads(ple_.ple_fd, miss_offs, miss_cache_dsts, n_miss);
+        for (int i = 0; i < n_miss; ++i) {
+            if (miss_user_dsts[i]) {
+                std::memcpy(miss_user_dsts[i], miss_cache_dsts[i], 160);
+            }
+        }
+    }
+}
+
+int32_t Qwen4ExpGfx1201Engine::sample_row_from_host_bf16_logits(const uint16_t* h_bf,
+                                                                const Nvfp4SamplingParams& sp,
+                                                                const std::vector<int32_t>* history,
+                                                                size_t hist_len,
+                                                                std::mt19937_64& rng,
+                                                                int32_t draft_tok,
+                                                                float* top1_prob_out,
+                                                                float* margin_out) {
     static constexpr int32_t kVocab = 248320;
-    uint16_t* h_bf = static_cast<uint16_t*>(h_cpu_upload_);
-    HIP_CHECK(hipMemcpy(h_bf, d_logits_bf16_, kVocab * sizeof(uint16_t), hipMemcpyDeviceToHost));
 
     std::vector<float> logits(kVocab);
     for (int32_t i = 0; i < kVocab; ++i) {
         logits[i] = bf16_bits_to_f32(h_bf[i]);
     }
 
-    if (history && !history->empty() &&
+    if (history && !history->empty() && hist_len > 0 &&
         (sp.presence_penalty != 0.0f || sp.frequency_penalty != 0.0f || sp.repeat_penalty != 1.0f)) {
         std::unordered_map<int32_t, int32_t> counts;
-        const size_t n_hist = history->size();
+        const size_t n_hist = std::min(history->size(), hist_len);
         const size_t start = (n_hist > 1024) ? (n_hist - 1024) : 0;
         for (size_t i = start; i < n_hist; ++i) {
             int32_t tid = (*history)[i];
@@ -934,14 +981,23 @@ int32_t Qwen4ExpGfx1201Engine::sample_from_device_logits(const Nvfp4SamplingPara
         int32_t id;
     };
     float max_l = -1e30f;
+    float max2_l = -1e30f;
     int32_t best_id = 0;
     for (int32_t i = 0; i < kVocab; ++i) {
-        if (logits[i] > max_l) {
-            max_l = logits[i];
+        float v = logits[i];
+        if (v > max_l) {
+            max2_l = max_l;
+            max_l = v;
             best_id = i;
+        } else if (v > max2_l) {
+            max2_l = v;
         }
     }
-    if (K <= 1 || sp.temperature <= 0.0f) return best_id;
+    if (margin_out) *margin_out = max_l - max2_l;
+    if (K <= 1 || sp.temperature <= 0.0f) {
+        if (top1_prob_out) *top1_prob_out = 1.0f;
+        return best_id;
+    }
 
     const float cutoff = max_l - 20.0f * std::max(1.0f, sp.temperature);
     std::vector<Cand> cands;
@@ -955,7 +1011,10 @@ int32_t Qwen4ExpGfx1201Engine::sample_from_device_logits(const Nvfp4SamplingPara
         cands.resize(kVocab);
         for (int32_t i = 0; i < kVocab; ++i) cands[i] = Cand{logits[i], i};
     }
-    if (cands.empty()) return best_id;
+    if (cands.empty()) {
+        if (top1_prob_out) *top1_prob_out = 1.0f;
+        return best_id;
+    }
 
     auto cmp = [](const Cand& a, const Cand& b) {
         return (a.val != b.val) ? (a.val > b.val) : (a.id < b.id);
@@ -976,7 +1035,10 @@ int32_t Qwen4ExpGfx1201Engine::sample_from_device_logits(const Nvfp4SamplingPara
         probs[i] = p;
         sum_p += p;
     }
-    if (sum_p <= 0.0) return cands[0].id;
+    if (sum_p <= 0.0) {
+        if (top1_prob_out) *top1_prob_out = 1.0f;
+        return cands[0].id;
+    }
 
     size_t keep = cands.size();
     if (sp.top_p > 0.0f && sp.top_p < 1.0f) {
@@ -991,6 +1053,47 @@ int32_t Qwen4ExpGfx1201Engine::sample_from_device_logits(const Nvfp4SamplingPara
             }
         }
     }
+    if (top1_prob_out) {
+        *top1_prob_out = static_cast<float>(probs[0] / std::max(1e-30, sum_p));
+    }
+
+    // Exact lossless point-mass speculative rejection sampling (DSpark §3.3.1 Eq. 8):
+    // For a deterministic draft token \hat{y} (q(\hat{y}) = 1, q(v != \hat{y}) = 0):
+    //   1. Accept \hat{y} with probability p_target(\hat{y}) = probs[idx_draft] / sum_p.
+    //   2. On rejection, sample from residual distribution p'(v) \propto max(0, p_target(v) - q(v)),
+    //      which for point-mass q(\hat{y}) = 1 equals p_target(v) restricted to v != \hat{y}.
+    if (draft_tok >= 0) {
+        ssize_t draft_idx = -1;
+        for (size_t i = 0; i < keep; ++i) {
+            if (cands[i].id == draft_tok) {
+                draft_idx = static_cast<ssize_t>(i);
+                break;
+            }
+        }
+        std::uniform_real_distribution<double> u01(0.0, 1.0);
+        const double r_acc = u01(rng);
+        const double p_draft = (draft_idx >= 0) ? (probs[draft_idx] / sum_p) : 0.0;
+        if (r_acc < p_draft) {
+            return draft_tok;
+        }
+        // Rejected: zero out draft_tok mass and sample from the residual distribution
+        double res_sum = sum_p - ((draft_idx >= 0) ? probs[draft_idx] : 0.0);
+        if (res_sum <= 1e-30) {
+            return cands[0].id;
+        }
+        std::uniform_real_distribution<double> dist_res(0.0, res_sum);
+        double r_res = dist_res(rng);
+        double acc = 0.0;
+        for (size_t i = 0; i < keep; ++i) {
+            if (static_cast<ssize_t>(i) == draft_idx) continue;
+            acc += probs[i];
+            if (r_res <= acc) return cands[i].id;
+        }
+        for (size_t i = keep; i > 0; --i) {
+            if (static_cast<ssize_t>(i - 1) != draft_idx) return cands[i - 1].id;
+        }
+        return cands[0].id;
+    }
 
     std::uniform_real_distribution<double> dist(0.0, sum_p);
     double r = dist(rng);
@@ -1000,6 +1103,17 @@ int32_t Qwen4ExpGfx1201Engine::sample_from_device_logits(const Nvfp4SamplingPara
         if (r <= acc) return cands[i].id;
     }
     return cands[keep - 1].id;
+}
+
+int32_t Qwen4ExpGfx1201Engine::sample_from_device_logits(const Nvfp4SamplingParams& sp,
+                                                         const std::vector<int32_t>* history,
+                                                         std::mt19937_64& rng) {
+    static constexpr int32_t kVocab = 248320;
+    uint16_t* h_bf = static_cast<uint16_t*>(h_cpu_upload_);
+    HIP_CHECK(hipMemcpy(h_bf, d_logits_bf16_, kVocab * sizeof(uint16_t), hipMemcpyDeviceToHost));
+    const size_t hist_len = history ? history->size() : 0;
+    return sample_row_from_host_bf16_logits(h_bf, sp, history, hist_len, rng, -1,
+                                            &last_target_prob_, &last_target_margin_);
 }
 
 void Qwen4ExpGfx1201Engine::save_recurrent_ckpt() {
@@ -1245,7 +1359,8 @@ void Qwen4ExpGfx1201Engine::run_mtp_kv_batch(const int32_t* next_toks, int32_t c
 }
 
 int32_t Qwen4ExpGfx1201Engine::run_mtp_step_token(int32_t next_tok, int32_t cell, bool from_ring,
-                                                  float* prob_out, float* margin_out) {
+                                                  float* prob_out, float* margin_out,
+                                                  int32_t ple_prev0, int32_t ple_prev1) {
     if (!mtp_.available) return -1;
     ensure_context_capacity(cell + 1);
 
@@ -1370,6 +1485,11 @@ int32_t Qwen4ExpGfx1201Engine::run_mtp_step_token(int32_t next_tok, int32_t cell
         void* a_ts[] = {&d_sh_gu_, &ptrs, &ptrs_vram, &d_cur_ids, &d_cur_wts, &d_sh_inter_};
         kernels_.launch_default("moe_topk_and_silu_mul_640", a_ts);
 
+        if (mtp_topk_ > 0 && mtp_topk_ < 10) {
+            strata::kernels::launch_nvfp4_mtp_topk_truncate(
+                static_cast<int32_t*>(d_cur_ids), static_cast<float*>(d_cur_wts), mtp_topk_, nullptr);
+        }
+
         HIP_CHECK(hipMemcpyAsync(h_route_bell_, d_route_bell_,
                                  2560 * sizeof(uint16_t) + 10 * sizeof(int32_t) + 10 * sizeof(float),
                                  hipMemcpyDeviceToHost, nullptr));
@@ -1403,12 +1523,25 @@ int32_t Qwen4ExpGfx1201Engine::run_mtp_step_token(int32_t next_tok, int32_t cell
         kernels_.launch_default("hc_mix_decode", m_args);
     }
 
-    {
+    if (d_mtp_dvocab_ != nullptr && n_mtp_dvocab_ > 0) {
+        strata::kernels::launch_nvfp4_mtp_dvocab_gemv(
+            d_final_hidden_, d_lm_head_, static_cast<const int32_t*>(d_mtp_dvocab_),
+            d_logits_bf16_, n_mtp_dvocab_, nullptr);
+        strata::kernels::launch_nvfp4_argmax_prob_margin_dvocab(
+            d_logits_bf16_, static_cast<const int32_t*>(d_mtp_dvocab_), n_mtp_dvocab_,
+            static_cast<int32_t*>(d_next_tok_),
+            static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), nullptr);
+    } else {
         void* a_lm[] = {&d_final_hidden_, &d_lm_head_, &d_logits_bf16_};
         kernels_.launch_default("bf16_gemv_248320_2560", a_lm);
         strata::kernels::launch_nvfp4_argmax_prob_margin_248320(
             d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
             static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), 1, nullptr);
+    }
+
+    // Overlap CPU PLE N-gram shard row prefetch with GPU MTP execution before blocking on hipMemcpy
+    if (ple_prev0 != -2 && ple_prev1 != -2) {
+        fetch_ple_rows_cached(&next_tok, &ple_prev0, &ple_prev1, 1, nullptr);
     }
 
     strata::kernels::Nvfp4ArgmaxSummary s{};
@@ -1423,6 +1556,23 @@ void Qwen4ExpGfx1201Engine::mtp_catchup_kv(const std::vector<int32_t>& history, 
     int32_t max_valid = static_cast<int32_t>(history.size()) - 1;
     int32_t end_pos = std::min(target_kv_pos, max_valid);
     if (end_pos <= mtp_kv_pos_) return;
+    if (d_mtp_dvocab_ != nullptr && !mtp_in_dvocab_.empty()) {
+        int32_t sync_from = n_mtp_dvocab_;
+        for (int32_t p = mtp_kv_pos_; p <= end_pos; ++p) {
+            int32_t tid = history[p];
+            if (tid >= 0 && tid < 248320 && !mtp_in_dvocab_[tid] && n_mtp_dvocab_ < 65536) {
+                mtp_in_dvocab_[tid] = 1;
+                h_mtp_dvocab_.push_back(tid);
+                n_mtp_dvocab_++;
+            }
+        }
+        if (n_mtp_dvocab_ > sync_from) {
+            HIP_CHECK(hipMemcpyAsync(static_cast<int32_t*>(d_mtp_dvocab_) + sync_from,
+                                     h_mtp_dvocab_.data() + sync_from,
+                                     static_cast<size_t>(n_mtp_dvocab_ - sync_from) * sizeof(int32_t),
+                                     hipMemcpyHostToDevice, nullptr));
+        }
+    }
     if (end_pos - mtp_kv_pos_ > kMtpRingCap) {
         mtp_kv_pos_ = end_pos - kMtpRingCap;
     }
@@ -1445,13 +1595,34 @@ void Qwen4ExpGfx1201Engine::draft_mtp(int32_t next_tok, const std::vector<int32_
         mtp_catchup_kv(history, cur_pos - 1);
     }
 
+    if (d_mtp_dvocab_ != nullptr && !mtp_in_dvocab_.empty()) {
+        int32_t sync_from = n_mtp_dvocab_;
+        auto ensure_in_dvocab = [&](int32_t tid) {
+            if (tid >= 0 && tid < 248320 && !mtp_in_dvocab_[tid] && n_mtp_dvocab_ < 65536) {
+                mtp_in_dvocab_[tid] = 1;
+                h_mtp_dvocab_.push_back(tid);
+                n_mtp_dvocab_++;
+            }
+        };
+        ensure_in_dvocab(history.back());
+        ensure_in_dvocab(next_tok);
+        if (n_mtp_dvocab_ > sync_from) {
+            HIP_CHECK(hipMemcpyAsync(static_cast<int32_t*>(d_mtp_dvocab_) + sync_from,
+                                     h_mtp_dvocab_.data() + sync_from,
+                                     static_cast<size_t>(n_mtp_dvocab_ - sync_from) * sizeof(int32_t),
+                                     hipMemcpyHostToDevice, nullptr));
+        }
+    }
+
     int32_t cur_tok = next_tok;
+    int32_t p0 = (history.size() >= 2) ? history[history.size() - 2] : strata::kernels::TOKEN_NULL;
+    int32_t p1 = history.back();
     for (int32_t j = 0; j < max_drafts; ++j) {
         float prob = 0.0f;
         float margin = 0.0f;
         const bool from_ring = (j == 0);
         const int32_t cell = (cur_pos - 1) + j;
-        int32_t d_tok = run_mtp_step_token(cur_tok, cell, from_ring, &prob, &margin);
+        int32_t d_tok = run_mtp_step_token(cur_tok, cell, from_ring, &prob, &margin, p0, p1);
         if (j == 0) {
             mtp_kv_pos_ = cur_pos;
         }
@@ -1467,6 +1638,8 @@ void Qwen4ExpGfx1201Engine::draft_mtp(int32_t next_tok, const std::vector<int32_
         }
         draft_out.push_back(d_tok);
         if (probs_out) probs_out->push_back(prob);
+        p0 = p1;
+        p1 = cur_tok;
         cur_tok = d_tok;
         const float step_chain_thresh = (j == 0) ? min_prob : std::max(min_prob, 0.70f);
         if (prob < step_chain_thresh) {
@@ -1927,6 +2100,8 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     d_mtp_h2_ = gpu_alloc(B * 10240 * sizeof(uint16_t));
     d_argmax_summary_ = gpu_alloc(4 * sizeof(strata::kernels::Nvfp4ArgmaxSummary));
     d_moe_gpu_align_ids_ = gpu_alloc(B * 10 * sizeof(int32_t));
+    d_mtp_dvocab_ = static_cast<int32_t*>(gpu_alloc(65536 * sizeof(int32_t), true));
+    ple_cache_.resize(kPleCacheSlots);
 }
 
 void Qwen4ExpGfx1201Engine::populate_rope_range(int32_t p_begin, int32_t p_end) {
@@ -2903,11 +3078,60 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
         mtp_.moe.d_ptrs_prefill = gpu_alloc(mtp_.moe.h_ptrs_prefill.size() * sizeof(int64_t), true);
         HIP_CHECK(hipMemcpy(mtp_.moe.d_ptrs, mtp_.moe.h_ptrs.data(), mtp_.moe.h_ptrs.size() * sizeof(int64_t),
                             hipMemcpyHostToDevice));
+        if (const char* env_tk = std::getenv("STRATA_MTP_TOPK")) {
+            mtp_topk_ = std::clamp(std::atoi(env_tk), 1, 10);
+        }
+        const char* env_dv = std::getenv("STRATA_MTP_DVOCAB");
+        bool want_dvocab = (env_dv == nullptr) || (std::strcmp(env_dv, "0") != 0 && std::strcmp(env_dv, "full") != 0);
+        if (want_dvocab && d_mtp_dvocab_ != nullptr) {
+            std::string dv_path = (env_dv && env_dv[0] != '\0' && std::strcmp(env_dv, "1") != 0)
+                                      ? std::string(env_dv)
+                                      : std::string("data/draft_vocab_en.bin");
+            std::error_code dv_ec;
+            if (!std::filesystem::exists(dv_path, dv_ec)) {
+                std::string cand2 = model_dir_ + "/draft_vocab_en.bin";
+                if (std::filesystem::exists(cand2, dv_ec)) dv_path = cand2;
+            }
+            int dv_fd = ::open(dv_path.c_str(), O_RDONLY);
+            if (dv_fd >= 0) {
+                off_t fsz = ::lseek(dv_fd, 0, SEEK_END);
+                int32_t n_ids = static_cast<int32_t>(fsz / static_cast<off_t>(sizeof(int32_t)));
+                if (n_ids > 0 && n_ids <= 60000) {
+                    h_mtp_dvocab_.resize(n_ids);
+                    h_mtp_dvocab_.reserve(65536);
+                    pread_exact(dv_fd, h_mtp_dvocab_.data(), static_cast<size_t>(n_ids) * sizeof(int32_t), 0);
+                    mtp_in_dvocab_.assign(248320, 0);
+                    int32_t valid_cnt = 0;
+                    for (int32_t i = 0; i < n_ids; ++i) {
+                        int32_t tid = h_mtp_dvocab_[i];
+                        if (tid >= 0 && tid < 248320 && !mtp_in_dvocab_[tid]) {
+                            mtp_in_dvocab_[tid] = 1;
+                            h_mtp_dvocab_[valid_cnt++] = tid;
+                        }
+                    }
+                    // Ensure EOS / stop tokens are always present in draft vocabulary
+                    for (int32_t eos_id : {248044, 248046}) {
+                        if (!mtp_in_dvocab_[eos_id] && valid_cnt < 65536) {
+                            mtp_in_dvocab_[eos_id] = 1;
+                            h_mtp_dvocab_.push_back(eos_id);
+                            valid_cnt++;
+                        }
+                    }
+                    h_mtp_dvocab_.resize(valid_cnt);
+                    n_mtp_dvocab_ = valid_cnt;
+                    HIP_CHECK(hipMemcpy(d_mtp_dvocab_, h_mtp_dvocab_.data(),
+                                        static_cast<size_t>(n_mtp_dvocab_) * sizeof(int32_t),
+                                        hipMemcpyHostToDevice));
+                }
+                ::close(dv_fd);
+            }
+        }
         mtp_.available = true;
         FILE* log_fp = serve_mode_ ? stderr : stdout;
         std::fprintf(log_fp,
-                     "[gfx1201-nvfp4] Loaded native MTP draft layer (BF16 dense + 512 FP8 experts in %.2f GiB mapped hugepage RAM)\n",
-                     static_cast<double>(total_mtp_exp_bytes) / (1024.0 * 1024.0 * 1024.0));
+                     "[gfx1201-nvfp4] Loaded native MTP draft layer (BF16 dense + 512 FP8 experts in %.2f GiB mapped hugepage RAM, topk=%d, dvocab=%d)\n",
+                     static_cast<double>(total_mtp_exp_bytes) / (1024.0 * 1024.0 * 1024.0),
+                     mtp_topk_, n_mtp_dvocab_);
         std::fflush(log_fp);
     }
 

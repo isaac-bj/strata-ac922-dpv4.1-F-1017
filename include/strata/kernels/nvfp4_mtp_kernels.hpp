@@ -75,4 +75,17 @@ void launch_nvfp4_moe_cap_gpu_cold(int32_t* d_cur_ids, int32_t* d_gpu_align_ids,
                                    const int64_t* d_ptrs_vram, int32_t pairs, int32_t max_gpu_cold,
                                    hipStream_t stream = nullptr);
 
+// Pruned draft vocabulary GEMV: computes logits_out [n_dvocab] = x [2560] x lm_head[dvocab[0..n_dvocab-1], 2560]^T.
+void launch_nvfp4_mtp_dvocab_gemv(const void* d_x_bf16, const void* d_lm_head_bf16, const int32_t* d_dvocab,
+                                  void* d_logits_out_bf16, int32_t n_dvocab, hipStream_t stream = nullptr);
+
+// Single-pass argmax + softmax probability + top-2 margin over n_dvocab logits, mapping winner via d_dvocab.
+void launch_nvfp4_argmax_prob_margin_dvocab(const void* d_logits_bf16, const int32_t* d_dvocab, int32_t n_dvocab,
+                                            int32_t* d_out_tok, Nvfp4ArgmaxSummary* d_out_summary,
+                                            hipStream_t stream = nullptr);
+
+// Truncate MTP top-10 routed experts to the top keep_k highest-weight experts and renormalize their weights.
+void launch_nvfp4_mtp_topk_truncate(int32_t* d_cur_ids, float* d_cur_wts, int32_t keep_k,
+                                    hipStream_t stream = nullptr);
+
 }  // namespace strata::kernels
