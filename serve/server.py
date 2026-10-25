@@ -81,6 +81,7 @@ from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
+from serve.structured import _extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
@@ -1456,6 +1457,15 @@ class StrataEngine:
             pn = prefix.get("tokens")
             if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
                 keys += f" pin={pn}"
+        # logprobs: the engine writes an `LP` line after each `T` line (an engine without them ignores
+        # the key, so an older engine answers exactly as it did).  Absent = no LP lines at all.
+        k = top_logprobs(sampling)
+        if k is not None:
+            keys += f" logprobs={k}"
+            ids = allowed_ids(sampling)
+            if ids:
+                # only these ids are printed; the engine's comma-separated list, renormalised below
+                keys += " allowed=" + ",".join(str(i) for i in ids)
         return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
 
     @staticmethod
@@ -2195,6 +2205,12 @@ class StrataEngine:
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
+        # logprobs: the engine writes "LP <logprob> [id:logprob ...]" right after each "T <id>" (the same
+        # flush), read here before the token is yielded, so whoever takes the token finds its line in
+        # lp_lines.  Not asked for = the deque stays empty and nothing on this path changes.
+        want_lp = top_logprobs(sampling or {}) is not None
+        self.lp_lines = LPLines(cancel)
+        carry = NO_LINE                  # a line read for a token's LP line, held until it is used
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -2222,7 +2238,10 @@ class StrataEngine:
                         raise self._silent(f"the engine said nothing for {time.monotonic() - heard:.0f} s during "
                                            "the request")
                 try:
-                    line = self.lines.get(timeout=min(wait, 0.5))
+                    if carry is not NO_LINE:              # the line read after a token for its LP line
+                        line, carry = carry, NO_LINE
+                    else:
+                        line = self.lines.get(timeout=min(wait, 0.5))
                 except queue.Empty:
                     if cancel.is_set():
                         return
@@ -2249,7 +2268,18 @@ class StrataEngine:
                     allow = silence
                     if cancel.is_set():
                         return
-                    yield int(line[2:])
+                    t = int(line[2:])
+                    if want_lp:
+                        # the engine writes the token and its `LP` line in one flush, so the line is
+                        # here now; an engine without logprobs leaves the next line a normal one
+                        try:
+                            carry = self.lines.get(timeout=0.5)
+                        except queue.Empty:
+                            carry = NO_LINE
+                        if isinstance(carry, str) and carry.startswith("LP "):
+                            self.lp_lines.append((t, carry))
+                            carry = NO_LINE
+                    yield t
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
@@ -2292,9 +2322,12 @@ class StrataEngine:
                 while True:
                     left = allow - (time.monotonic() - heard) if allow > 0 else None
                     try:
-                        if left is not None and left <= 0:
+                        if carry is not NO_LINE:          # read already, after the last token
+                            line, carry = carry, NO_LINE
+                        elif left is not None and left <= 0:
                             raise queue.Empty
-                        line = self.lines.get(timeout=left)
+                        else:
+                            line = self.lines.get(timeout=left)
                     except queue.Empty:
                         raise self._silent("the engine did not finish the request after it was stopped (STOP) "
                                            f"within {allow:.0f} s") from None
@@ -3720,6 +3753,59 @@ class Detokenizer:
 OPENAI_MAX_STOP = 4                                  # OpenAI's limit on `stop`
 
 
+def top_logprobs(req: dict):
+    """The K for the engine's logprobs=K, or None when the request did not ask.
+
+    OpenAI: "logprobs": true with "top_logprobs" 0..20; the legacy completions form,
+    "logprobs": N, is taken as N."""
+    lp = req.get("logprobs")
+    if lp is True:
+        k = req.get("top_logprobs")
+        return max(0, min(20, k)) if isinstance(k, int) and not isinstance(k, bool) else 0
+    if isinstance(lp, int) and not isinstance(lp, bool) and lp >= 0:
+        return min(20, lp)
+    return None
+
+
+def allowed_ids(req: dict) -> list:
+    """`allowed_token_ids`: the ids a caller named, or [] (vLLM's semantics, see LogprobEntries)."""
+    ids = req.get("allowed_token_ids")
+    if not isinstance(ids, (list, tuple)):
+        return []
+    return [x for x in ids if isinstance(x, int) and not isinstance(x, bool) and x >= 0]
+
+
+def check_logprobs(req: dict, svc, max_req: int) -> None:
+    """The checks a logprobs request passes before anything is sent (chat and legacy completions alike)."""
+    if top_logprobs(req) is None:
+        return
+    if not 0 < max_req <= LOGPROBS_MAX_TOKENS:
+        raise ValueError(f"logprobs: max_tokens (or max_completion_tokens) 1..{LOGPROBS_MAX_TOKENS} is required")
+    if getattr(svc.engine, "batch", 0):
+        # --parallel/--batch: the batched loop prints "BT <slot> <id>" and never calls emit_lp_line, so no
+        # LP line ever reaches the server there (src/program/generate.cpp).  Refused rather than answered
+        # with the field missing, which a client cannot tell from a reply that had no tokens.
+        raise ValueError("logprobs is not available when the engine runs requests in batch slots "
+                         "(--parallel/--batch): it writes no LP lines there; start the server without "
+                         "--parallel")
+    n_vocab = len(getattr(svc.tok, "tokens", ())) or None
+    if n_vocab:
+        # emit_lp_line indexes the logits row with each named id as given, so an id past the vocabulary
+        # would read out of bounds: refused here, before anything is sent
+        bad = [i for i in allowed_ids(req) if i >= n_vocab]
+        if bad:
+            raise ValueError(f"allowed_token_ids: {bad[0]} is outside the vocabulary "
+                             f"(0..{n_vocab - 1})")
+
+
+NO_LINE = object()                                   # StrataEngine.generate: no line held after a token
+
+# A reply with logprobs keeps every entry (its token, bytes and up to 20 alternatives) until it ends when it is not
+# streamed or answers a json_schema, and spell() matches text against the entries still pending: a bounded reply
+# keeps that memory and work bounded.
+LOGPROBS_MAX_TOKENS = 4096
+
+
 def stop_strings(req: dict) -> list[str]:
     """The request's stop strings: OpenAI's `stop` (a string or a list of up to 4) or Anthropic's `stop_sequences`
     (a list).  Empty strings are left out.  A bad value is a ValueError, so a 400 before anything is generated."""
@@ -4713,7 +4799,7 @@ class Service:
             # one request at a time (more wait their turn), or "parallel": N batch slots (#465)
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": getattr(self, "requested_slots", max(1, int(getattr(self.engine, "batch", 0) or 0)))},
-            "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
+            "dialects": ["/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images, "available": images, "error": None},
             "image_generation": self.images.status() if self.images is not None else {"enabled": False},
             "activity": {"requests": totals["requests"] + running,
@@ -5814,6 +5900,138 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 PP_DONE_TAIL = 64
 
 
+
+class LPLines(collections.deque):
+    """One request's LP lines, tagged with its cancel Event (one per request, handed unchanged from the handler
+    through Service.run to Engine.generate).  The last events of a request - the parser's and the stop strings'
+    tail - come after it has left the queue, when the next request may already have replaced the engine's lp_lines
+    with its own: LogprobEntries reads only the lines tagged with its own request's Event."""
+
+    def __init__(self, owner=None):
+        super().__init__()
+        self.owner = owner
+
+
+class LogprobEntries:
+    """The engine's LP lines as OpenAI's logprobs.content entries.
+
+    Each token's "token" is the text it completes (an incremental UTF-8 decode, as the reply's
+    text is made), so a character split across tokens lands in the token that finishes it and
+    the tokens, joined, spell the reply.  "bytes" are the token's own bytes.  The stop token
+    ends the reply and is not listed (OpenAI does not list it either).  Tokens that make no
+    text of the reply are left out, because spell() gives each piece of text the tokens that
+    spell it.
+
+    `allowed_token_ids`: only those ids are kept, and the logprobs are renormalised over them,
+    so a caller asking about specific candidates gets a distribution over exactly those instead
+    of a top-K list it has to hope contains them.  vLLM, which named the field, masks generation
+    with these ids instead (every other logit -inf before sampling) and reports the unmasked
+    distribution; here they filter what is reported, so the chosen token can be outside them.
+
+    Not on `--parallel`: the engine's batched loop prints `BT <slot> <id>` and never an LP line,
+    so a request that asks for logprobs on such a server is refused (400) before it starts.
+    """
+
+    def __init__(self, svc, allowed=(), owner=None):
+        self.tok, self.stop_ids = svc.tok, svc.stop_ids
+        self.allowed = [i for i in allowed]
+        self.inc = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.pending = []                          # entries read but not yet given to a piece of text
+        self.owner = owner                         # the request's cancel Event (LPLines)
+        self.lines = None                          # this request's current LPLines, kept once seen
+
+    def spell(self, eng, text: str) -> list:
+        """The entries whose tokens spell `text`, the next piece of the reply."""
+        self.pending += self.take(eng)
+        at = [0]
+        for e in self.pending:
+            at.append(at[-1] + len(e["token"]))
+        joined = "".join(e["token"] for e in self.pending)
+        i = joined.find(text)
+        while i >= 0 and text:
+            if i in at:
+                a = at.index(i)                    # the first token there
+                end = i + len(text)
+                b = next((j for j in range(a + 1, len(at)) if at[j] == end), None)
+                if b is not None:
+                    out, self.pending = self.pending[a:b], self.pending[b:]
+                    return out
+            i = joined.find(text, i + 1)
+        out, self.pending = self.pending, []
+        return out
+
+    def raw(self, t):
+        if hasattr(self.tok, "token_bytes"):
+            return self.tok.token_bytes(t)
+        return self.tok.decode([t]).encode("utf-8")
+
+    def take(self, eng) -> list:
+        # the engine's current lines are this request's only when they carry its Event (a later generate pass
+        # of the same request makes new ones: the old ones are read to the end first); another request's never are
+        cur, old = getattr(eng, "lp_lines", None), None
+        if cur is not self.lines and getattr(cur, "owner", None) is self.owner:
+            old, self.lines = self.lines, cur
+        out = []
+        for lines in (old, self.lines):
+            while lines:
+                t, line = lines.popleft()
+                if t in self.stop_ids:
+                    continue
+                f = line.split()
+                if len(f) < 2:
+                    continue
+                try:                               # "nan" (no head logits for that window row), "-nan(ind)"
+                    lp = float(f[1])               # (MSVC) or a cut line: no entry for that token
+                    alts = [(int(i), float(v)) for i, _, v in (x.partition(":") for x in f[2:])]
+                except ValueError:
+                    continue
+                if not math.isfinite(lp) or not all(math.isfinite(v) for _, v in alts):
+                    continue
+                b = self.raw(t)
+                e = {"token": self.inc.decode(b), "logprob": lp, "bytes": list(b),
+                     "top_logprobs": []}
+                if self.allowed:
+                    alts = [(i, v) for i, v in alts if i in self.allowed]
+                for i, v in alts:
+                    alt = self.raw(i)
+                    e["top_logprobs"].append({"token": alt.decode("utf-8", "replace"),
+                                              "logprob": v, "bytes": list(alt)})
+                if self.allowed:
+                    e = self._renormalise(e, t, lp)
+                out.append(e)
+        return out
+
+    def _renormalise(self, e, t, lp):
+        """Keep only the named ids and normalise over them, so they sum to 1.
+
+        The line carries the chosen token's own logprob on its head and the named ids after it, and never
+        repeats the chosen one among them.  So the chosen token is put back when the caller named it: with
+        `allowed_token_ids` naming only the token the model chose, that token is then the whole distribution,
+        at 1 (logprob 0), which is what vLLM's mask gives -- here it used to leave nothing to normalise over,
+        which returned None, the entry was appended all the same, and the reply failed on e["token"].  A line
+        that carries none of the named ids has nothing to normalise over either: the entry keeps the chosen
+        token and its own logprob, with no alternatives.  It is never None and never dropped, because the
+        reply's tokens have to keep spelling its text.
+        """
+        cand = e["top_logprobs"]
+        own = None
+        if t in self.allowed:                      # named, and not repeated on the line: it is a candidate
+            b = self.raw(t)
+            own = {"token": b.decode("utf-8", "replace"), "logprob": lp, "bytes": list(b)}
+            cand = [own] + cand
+        if not cand:
+            return e                               # no named id observed for this token: its own logprob, no top
+        mx = max(x["logprob"] for x in cand)
+        se = sum(math.exp(x["logprob"] - mx) for x in cand)
+        lse = mx + math.log(se)
+        for x in cand:
+            x["logprob"] -= lse
+        cand.sort(key=lambda x: -x["logprob"])     # most likely first, as the unfiltered top-k already is
+        e["top_logprobs"] = cand
+        if own is not None:                        # the chosen token is in the distribution: report its own value
+            e["logprob"] = own["logprob"]           # (it used to copy the first alternative's, another token's)
+        return e
+
 def prompt_progress(svc: Service):
     """The last PP line as llama.cpp's `prompt_progress`, so a client written for llama.cpp reads both servers: the
     same four fields, `time_ms` elapsed since prompt reading started, and `processed` counting from token 0 so that a
@@ -5847,6 +6065,13 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
     yield chunk({"role": "assistant", "content": ""})
+    lp = LogprobEntries(svc, allowed_ids(req), cancel) if top_logprobs(req) is not None else None
+
+    def with_lp(c, key):
+        got = lp.spell(svc.engine, c["choices"][0]["delta"][key]) if lp is not None else None
+        if got:
+            c["choices"][0]["logprobs"] = {key: got}
+        return c
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
@@ -5863,9 +6088,9 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         elif kind == "event":
             ev: Event = x
             if ev.kind == "reasoning" and ev.text:
-                yield chunk({"reasoning_content": ev.text})
+                yield with_lp(chunk({"reasoning_content": ev.text}), "reasoning_content")
             elif ev.kind == "content" and ev.text:
-                yield chunk({"content": ev.text})
+                yield with_lp(chunk({"content": ev.text}), "content")
             elif ev.kind == "tool_start":
                 streamed[ev.call.id] = calls
                 calls += 1
@@ -5905,11 +6130,14 @@ def _is_json(text: str) -> bool:
 
 def openai_collect(chunks) -> dict:
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
+    lps = {}                                       # "content" / "reasoning_content" -> logprob entries
     for c in chunks:
         if c is None:                              # a heartbeat
             continue
         if c.get("strata_mcp"):
             mcp.append(c["strata_mcp"])
+        for k, v in (c["choices"][0].get("logprobs") or {}).items():
+            lps.setdefault(k, []).extend(v)
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
@@ -5936,8 +6164,126 @@ def openai_collect(chunks) -> dict:
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
            "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
            "usage": last["usage"]}
+    if lps:
+        out["choices"][0]["logprobs"] = {"content": lps.get("content", []), "refusal": None, **(
+            {"reasoning_content": lps["reasoning_content"]} if lps.get("reasoning_content") else {})}
     if last.get("timings"):
         out["timings"] = last["timings"]
+    return out
+
+
+class CompletionLogprobs:
+    """The engine's LP lines as the legacy /v1/completions `logprobs` object (vLLM's shape):
+    `tokens`, `token_logprobs`, `top_logprobs` (one {token: logprob} per token) and `text_offset`.
+
+    Unlike LogprobEntries every generated token is listed, the stop token too, so a one-token decision whose most
+    likely token is a stop token still has its distribution.  `allowed_token_ids` reports the named ids'
+    full-vocabulary logprobs, not renormalised (vLLM also reports the unmasked distribution), so a caller can tell
+    how much of the mass its labels hold.  `return_tokens_as_token_ids` keys every token as "token_id:<id>", which
+    keeps two ids that decode to the same text apart."""
+
+    def __init__(self, svc, req, owner):
+        self.tok, self.stop_ids, self.owner = svc.tok, svc.stop_ids, owner
+        self.allowed = allowed_ids(req)
+        self.as_ids = req.get("return_tokens_as_token_ids") is True
+        self.seen = []                             # this request's LPLines, in order (one per generate pass)
+
+    def watch(self, eng):
+        cur = getattr(eng, "lp_lines", None)
+        if getattr(cur, "owner", None) is self.owner and not any(cur is s for s in self.seen):
+            self.seen.append(cur)
+
+    def text(self, t) -> str:
+        raw = self.tok.token_bytes(t) if hasattr(self.tok, "token_bytes") else self.tok.decode([t]).encode("utf-8")
+        return raw.decode("utf-8", "replace")
+
+    def name(self, t) -> str:
+        return f"token_id:{t}" if self.as_ids else self.text(t)
+
+    def build(self, offset: int) -> dict:
+        out = {"tokens": [], "token_logprobs": [], "top_logprobs": [], "text_offset": []}
+        for lines in self.seen:
+            while lines:
+                t, line = lines.popleft()
+                f = line.split()
+                try:                               # "LP nan": no head logits for that window row
+                    lp = float(f[1])
+                    alts = [(int(i), float(v)) for i, _, v in (x.partition(":") for x in f[2:])]
+                except (IndexError, ValueError):
+                    lp, alts = None, []
+                if self.allowed and t in self.allowed and lp is not None:
+                    alts = [(t, lp)] + alts        # the line never repeats the chosen id among the named ones
+                out["tokens"].append(self.name(t))
+                out["token_logprobs"].append(lp if lp is not None and math.isfinite(lp) else None)
+                out["top_logprobs"].append({self.name(i): v for i, v in alts if math.isfinite(v)})
+                out["text_offset"].append(offset)
+                offset += 0 if t in self.stop_ids else len(self.text(t))
+        return out
+
+
+def logprob_span(text: str, part: str, entries: list):
+    """The entries whose tokens spell `part`, a piece of `text`, or None when the tokens do not
+    spell `text` or no token boundary falls at both ends of `part`."""
+    if "".join(e["token"] for e in entries) != text:
+        return None
+    start = text.find(part)
+    if start < 0:
+        return None
+    at, first = 0, None
+    for i, e in enumerate(entries):
+        if at == start and first is None:
+            first = i
+        if at == start + len(part) and first is not None:
+            return entries[first:i]
+        at += len(e["token"])
+    return entries[first:] if first is not None and at == start + len(part) else None
+
+
+def _same_json(a: str, b: str) -> bool:
+    """Are two strings the same JSON value (whitespace and key order aside)?  No -> False."""
+    try:
+        return json.loads(a) == json.loads(b)
+    except Exception:
+        return False
+
+
+def _structured_logprobs(choice: dict, content: str):
+    """`content`'s logprobs, and the content the tokens actually spell.
+
+    Returns `(content, logprobs)`: on failure `(the content as validated, None)`.
+
+    `structured_chunks` returns the canonical JSON the validator produced, which the model never
+    generated, so its tokens do not spell it.  Two honest outcomes:
+
+      1. a run of tokens spells what is being returned -> use it as it is;
+      2. the tokens spell the model's own JSON, which is the same JSON value (the fenced-with-spaces
+         case, the common one) -> return the model's form, so `''.join(token) == content` again.
+
+    Neither holds (a rearranged key order, or a reply that is not that JSON at all) and there are no
+    logprobs: a caller that joins the tokens must not silently get something that does not match.
+    """
+    lps = choice.get("logprobs")
+    if not lps or not lps.get("content"):
+        return content, None
+    raw = choice["message"]["content"] or ""
+    entries = lps["content"]
+    if raw == content:                          # not rewritten: the entries are already its
+        return content, _with_reasoning(lps, entries)
+    span = logprob_span(raw, content, entries)
+    if span is not None:
+        return content, _with_reasoning(lps, span)
+    inner = _extract_json(raw) if _extract_json else ""
+    if inner and _same_json(inner, content):
+        span = logprob_span(raw, inner, entries)
+        if span is not None:
+            return inner, _with_reasoning(lps, span)   # the model's own form: the tokens spell it
+    return content, None
+
+
+def _with_reasoning(lps: dict, entries: list) -> dict:
+    out = {"content": entries}
+    if lps.get("reasoning_content"):
+        out["reasoning_content"] = lps["reasoning_content"]
     return out
 
 
@@ -5956,12 +6302,23 @@ def structured_chunks(chunks, validator):
         result = openai_collect(buffered)
         choice = result["choices"][0]
         content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
+        # logprobs: the entries spell what the model wrote, which this function replaces with the
+        # canonical JSON.  `_structured_logprobs` gives back the form the tokens spell, or None.
+        content, logprobs = _structured_logprobs(choice, content)
         yield buffered[0]
         delta = {"content": content}
         if choice["message"].get("reasoning_content"):
             delta["reasoning_content"] = choice["message"]["reasoning_content"]
-        yield {**buffered[0], "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-        yield buffered[-1]
+        piece = {"index": 0, "delta": delta, "finish_reason": None}
+        if logprobs:
+            piece["logprobs"] = logprobs
+        yield {**buffered[0], "choices": [piece]}
+        end = buffered[-1]
+        if end["choices"][0].get("logprobs"):
+            # those entries went out in the piece above (or were dropped with it): the closing
+            # chunk must not carry a second copy
+            end = {**end, "choices": [{k: v for k, v in end["choices"][0].items() if k != "logprobs"}]}
+        yield end
     finally:
         chunks.close()
 
@@ -6819,7 +7176,7 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
-                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                if path in ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
@@ -6834,6 +7191,8 @@ def make_handler(svc: Service):
                     self._json(code, body)
                 elif path == "/v1/chat/completions":
                     self._openai(req)
+                elif path == "/v1/completions":
+                    self._completions(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
@@ -6848,7 +7207,7 @@ def make_handler(svc: Service):
                            else {"error": {"type": "server_error", "message": str(e)}})
             except ValueError as e:
                 print(f"[strata] 400 invalid request: {e}", flush=True)
-                if path == "/v1/responses":
+                if path in ("/v1/responses", "/v1/completions"):
                     self._json(400, responses_error_body(str(e)))
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
@@ -6879,9 +7238,19 @@ def make_handler(svc: Service):
                                   "message": f"the request is malformed ({type(e).__name__}: {e})"}}
                 self._json(400, responses_error_body(body["error"]["message"]) if path == "/v1/responses" else body)
             except EngineDied as e:                          # before the answer started (not streamed)
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                body = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                if getattr(self, "answer_started", False):
+                    self._note(error=body["error"])
+                    self.wfile.write(b"data: " + json.dumps(body).encode() + b"\n\ndata: [DONE]\n\n")
+                else:
+                    self._json(503, body)
             except EngineStuck as e:                         # an unload or restart that could not end the engine
-                self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                body = {"error": {"type": "server_error", "message": str(e)}}
+                if getattr(self, "answer_started", False):
+                    self._note(error=body["error"])
+                    self.wfile.write(b"data: " + json.dumps(body).encode() + b"\n\ndata: [DONE]\n\n")
+                else:
+                    self._json(503, body)
 
             except ClientGone:                               # #1999: the client left while the request was prepared
                 self._note(outcome="disconnected")
@@ -7108,6 +7477,9 @@ def make_handler(svc: Service):
                             delta = item["choices"][0]["delta"]
                             content, reasoning = delta.get("content", ""), delta.get("reasoning_content", "")
                             usage, timings = item.get("usage"), item.get("timings")
+                        elif api == "completions":
+                            content, reasoning = item["choices"][0]["text"], ""
+                            usage, timings = item.get("usage"), None
                         elif api == "responses":
                             kind = item["type"]
                             content = item["delta"] if kind == "response.output_text.delta" else ""
@@ -7145,6 +7517,7 @@ def make_handler(svc: Service):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            check_logprobs(req, svc, max_req)
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
@@ -7185,22 +7558,183 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 svc.note_client_disconnect(cancel)           # client went away: stop the engine
                 chunks.close()
-            except EngineDied as e:                          # mid-stream: say so, then end the stream properly
+            except (EngineDied, EngineStuck) as e:
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                try:
+                    self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                except OSError:
+                    self._note(outcome="disconnected")
             except QueueWaitExpired as e:
                 err = {"error": {"type": "rate_limit_error", "code": "queue_wait_timeout", "message": str(e)}}
                 self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                try:
+                    self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                except OSError:
+                    self._note(outcome="disconnected")
             except StructuredOutputError as e:
                 err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
                 self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                try:
+                    self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                except OSError:
+                    self._note(outcome="disconnected")
+            except ValueError as e:
+                err = {"error": {"type": "server_error", "message": str(e)}}
+                self._note(error=err["error"])
+                try:
+                    self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                except OSError:
+                    self._note(outcome="disconnected")
+
+        def _completions(self, req):
+            """OpenAI legacy text completions over a caller-tokenized prompt (no chat template)."""
+            req = svc.with_shared(req, "openai")
+            prompt = req.get("prompt")
+            n_vocab = len(getattr(svc.tok, "tokens", ())) or None
+            # a string, or one prompt already tokenized (a list of token ids, as vLLM takes it)
+            given_ids = isinstance(prompt, list) and bool(prompt) and \
+                all(isinstance(i, int) and not isinstance(i, bool) and i >= 0 for i in prompt)
+            if not isinstance(prompt, str) and not given_ids:
+                raise ValueError("prompt must be a string or a list of token ids (one prompt per request)")
+            if given_ids and n_vocab and max(prompt) >= n_vocab:
+                raise ValueError(f"prompt: token id {max(prompt)} is outside the vocabulary (0..{n_vocab - 1})")
+            for key in ("n", "best_of"):
+                value = req.get(key, 1)
+                if value != 1:
+                    raise ValueError(f"{key} must be 1 (the server generates one sequence at a time)")
+            if req.get("suffix") not in (None, ""):
+                raise ValueError("suffix is not supported")
+            if req.get("logprobs") not in (None, False) and top_logprobs(req) is None:
+                raise ValueError("logprobs must be a whole number 0..20 (or true with top_logprobs)")
+            if top_logprobs(req) is not None and req.get("stream"):
+                raise ValueError("logprobs on /v1/completions are not supported with stream: true")
+            stream_options = req.get("stream_options")
+            if stream_options is not None:
+                if not isinstance(stream_options, dict) or set(stream_options) - {"include_usage"}:
+                    raise ValueError("stream_options supports only include_usage")
+                if not req.get("stream"):
+                    raise ValueError("stream_options are only supported with stream: true")
+            _, _, template_kwargs = openai_to_messages({**req, "messages": []})
+            thinking = template_kwargs.get("enable_thinking", True) is not False
+            if req.get("enable_thinking") is False or req.get("thinking") is False:
+                thinking = False
+            thinking_cfg = req.get("thinking")
+            if isinstance(thinking_cfg, dict) and thinking_cfg.get("type") == "disabled":
+                thinking = False
+            bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
+            ids = list(prompt) if given_ids else svc.tok.encode(prompt, parse_special=True)
+            if given_ids:
+                prompt = svc.tok.decode(ids)             # for echo and text_offset
+            if thinking is False:                        # passthrough stays untouched when thinking is on; asked off,
+                tail = svc.tok.encode(svc.template.gen_prompt_tail(False), parse_special=True)   # the prompt gets the tail
+                tail_on = svc.tok.encode(svc.template.gen_prompt_tail(True), parse_special=True)  # a chat render adds
+                if tail and ids[-len(tail):] != tail and (not tail_on or ids[-len(tail_on):] != tail_on):
+                    ids = ids + tail
+            try:
+                max_new = int(req.get("max_tokens") or 0)
+            except (TypeError, ValueError):
+                raise ValueError("max_tokens must be a whole number")
+            check_logprobs(req, svc, max_new)
+            bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
+            svc.reasoning_budget(req)
+            stop_strings(req)
+            check_request_sampling(req)
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            lp = CompletionLogprobs(svc, req, cancel) if top_logprobs(req) is not None else None
+            svc.load()
+            model = svc.model_for(req)
+            cid, created = "cmpl-" + uuid.uuid4().hex[:24], int(time.time())
+            max_new = max_new if max_new > 0 else None
+            ctx = svc.engine.max_context
+            if ctx <= 0:
+                ctx = getattr(svc.engine, "known_ctx", 0)
+            if ctx <= 0:
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+            room = ctx - CTX_SLACK - len(ids)
+            if room < 1:
+                raise ValueError("request exceeds the context window: prompt leaves no room to answer")
+            if max_new is None:
+                max_new = room
+            elif max_new > room:
+                if not svc.fit_max_tokens:
+                    raise ValueError(f"request exceeds the context window: prompt + max_tokens exceeds context "
+                                     f"(at most {room} tokens here)")
+                max_new = room
+
+            def chunks():
+                try:
+                    if req.get("echo"):
+                        yield {"id": cid, "object": "text_completion", "created": created, "model": model,
+                               "choices": [{"text": prompt, "index": 0, "logprobs": None, "finish_reason": None}]}
+                    for kind, value in svc.run(ids, thinking, None, max_new, req, cancel):
+                        if lp is not None:
+                            lp.watch(svc.engine)
+                        if kind == "ping":
+                            yield None
+                        elif kind == "event":
+                            if value.kind in ("content", "reasoning") and value.text:
+                                yield {"id": cid, "object": "text_completion", "created": created, "model": model,
+                                       "choices": [{"text": value.text, "index": 0, "logprobs": None,
+                                                    "finish_reason": None}]}
+                        elif kind == "done":
+                            completion_tokens = value["completion_tokens"]
+                            yield {"id": cid, "object": "text_completion", "created": created, "model": model,
+                                   "choices": [{"text": "", "index": 0, "logprobs": None,
+                                                "finish_reason": {"cancel": "stop"}.get(value["finish"], value["finish"])}],
+                                   "usage": {"prompt_tokens": len(ids), "completion_tokens": completion_tokens,
+                                             "total_tokens": len(ids) + completion_tokens}}
+                finally:
+                    cancel.set() if self.watch_done is None else None
+
+            stream_chunks = self._capture(chunks(), "completions")
+            stream = bool(req.get("stream"))
+            if not stream:
+                text = []
+                last = None
+                for item in stream_chunks:
+                    if item is not None:
+                        if "usage" in item:
+                            last = item
+                        else:
+                            text.append(item["choices"][0]["text"])
+                result = last or {"id": cid, "object": "text_completion", "created": created, "model": model,
+                                  "choices": [{"index": 0, "text": "", "logprobs": None, "finish_reason": "length"}],
+                                  "usage": {"prompt_tokens": len(ids), "completion_tokens": 0, "total_tokens": len(ids)}}
+                result["choices"][0]["text"] = "".join(text)
+                if lp is not None:
+                    lp.watch(svc.engine)
+                    result["choices"][0]["logprobs"] = lp.build(len(prompt) if req.get("echo") else 0)
+                self._json(200, result)
+                return
+            self._sse()
+            try:
+                for item in stream_chunks:
+                    if item is None:
+                        self.wfile.write(b": keep-alive\n\n")
+                    else:
+                        self.wfile.write(b"data: " + json.dumps(item, ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+            except OSError:
+                self._note(outcome="disconnected")
+                cancel.set()
+                stream_chunks.close()
+            except (EngineDied, EngineStuck) as e:           # mid-stream: say so, then end the stream properly
+                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                self._note(error=err["error"])
+                try:
+                    self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                except OSError:
+                    self._note(outcome="disconnected")
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                try:
+                    self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                except OSError:
+                    self._note(outcome="disconnected")
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""

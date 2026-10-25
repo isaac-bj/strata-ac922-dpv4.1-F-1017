@@ -828,6 +828,7 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | API | Endpoint |
 | --- | --- |
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
+| OpenAI text completions (stream and non-stream, raw prompt) | `POST /v1/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
 | OpenAI Responses (stream and non-stream, tools; stateless, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses` |
 | Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
@@ -923,6 +924,26 @@ print(r.choices[0].message.content)
   `max_tokens` (the rest of the context) get a budget of three quarters of it. `"answer_room": false` in
   `strata-<model>.json` turns it off. Qwen recommends up to 262,144 tokens of reasoning and 131,072 of answer: a client
   should not cap the reply far below what the context allows.
+- **logprobs: how likely each token was (CUDA/HIP).** `"logprobs": true` with `"top_logprobs": 0..20` on
+  `/v1/chat/completions`, streamed or not, adds `choices[0].logprobs.content[]` to the reply (`token`, `logprob`,
+  `bytes`, `top_logprobs`); with thinking on, the thinking's entries come under `reasoning_content` instead. The
+  tokens, joined, spell the reply exactly (a character split across two tokens lands in the one that finishes it).
+  A reply that asks for logprobs needs `max_tokens` or `max_completion_tokens` of 1 to 4,096 and gets a 400
+  without it, because a reply that is not streamed holds its entries until it ends. `"allowed_token_ids": [ids]`
+  keeps only those ids in `top_logprobs`, most likely first, renormalised to sum to 1; the chosen token is one of
+  them when it was named (vLLM's field, but vLLM masks generation with it, while here it filters what is reported,
+  so a token outside the named ids keeps its own `logprob` and an empty list). An id past the model's vocabulary is
+  a 400. A token whose probability could not be read gets no entry, and the reply goes on. On a server started with
+  `--parallel`, a request that asks for logprobs gets a 400: the engine's batched loop writes no LP lines, so there is
+  nothing to report.
+- **logprobs on `/v1/completions` (vLLM's shape).** `"logprobs": N` (0..20, or `true` with `top_logprobs`) adds
+  `choices[0].logprobs` with `tokens`, `token_logprobs`, `top_logprobs` (one `{token: logprob}` per token) and
+  `text_offset`, not streamed. Every generated token is listed, the stop token too, so a one-token read whose most
+  likely token is the stop still has its distribution. `"allowed_token_ids"` lists those ids with their
+  full-vocabulary logprobs, not renormalised (unlike chat), so a caller can tell how much of the mass its labels hold;
+  `"return_tokens_as_token_ids": true` keys every token as `token_id:<id>`. The prompt may also be a list of token
+  ids. This is what a decision client reads from `vllm serve`: a typed choice from one next-token distribution
+  (AnyJev's `StrataBackend`). The limits are the chat ones: `max_tokens` 1 to 4,096 and no `--parallel`.
 - **A reply that ends inside its thinking (#1053, opt-in).** Some turns write a sentence of reasoning and then the
   end-of-turn token with no `</think>`: the content is empty and an agent stops. `"reasoning_close_retry": true` in
   `strata-<model>.json` closes the thinking once (as the thinking budget does) and continues, once per request, only for
