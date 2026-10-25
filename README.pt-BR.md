@@ -164,7 +164,8 @@ Inicie com `strata launch --model gyro-s`. Detalhes: [docs/GYRO.md](docs/GYRO.md
 
 Com menos RAM do que a linha indica, ainda pode funcionar, só que mais devagar: o Strata muda sozinho para o
 [modo de pouca RAM](docs/MODELS.md#a-big-graphics-card-and-little-ram). Há também:
-[NVFP4](docs/NVFP4.md) para placas NVIDIA, [Qwen3.6-35B-A3B](docs/QWEN36.md) (menor, vários pedidos ao mesmo tempo) e
+[NVFP4](docs/NVFP4.md) para placas NVIDIA, [o Signal da agentionai](docs/MODELS.md#signal-3-8-flash-next)
+(um ajuste que pensa menos, com `--family signal`), [Qwen3.6-35B-A3B](docs/QWEN36.md) (menor, vários pedidos ao mesmo tempo) e
 [o Uncensored IQ3_XXS da OrcaRouter](docs/MODELS.md#orcarouter-uncensored-iq3_xxs). Todos os tamanhos e o que cabe em cada configuração:
 [docs/MODELS.md](docs/MODELS.md).
 

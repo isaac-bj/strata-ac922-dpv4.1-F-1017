@@ -161,7 +161,8 @@ NVIDIA、AMD、Intel Arc、Apple Silicon で動きます。
 | **96 GB 以上** | Unsloth の **UD-IQ4_XS** から **Q8_0** | 完全版にいちばん近いです |
 
 表の行より RAM が少なくても、遅くなるだけで動くことがあります。Strata は自動で[低RAMモード](docs/MODELS.md#a-big-graphics-card-and-little-ram)に切り替わります。
-そのほかに、NVIDIA カード向けの [NVFP4](docs/NVFP4.md)、[Qwen3.6-35B-A3B](docs/QWEN36.md)（より小さく、複数のリクエストを同時に処理）、
+そのほかに、NVIDIA カード向けの [NVFP4](docs/NVFP4.md)、
+agentionai の [Signal](docs/MODELS.md#signal-3-8-flash-next)（考え方が直接的なファインチューン、`--family signal` で）、[Qwen3.6-35B-A3B](docs/QWEN36.md)（より小さく、複数のリクエストを同時に処理）、
 [OrcaRouter の Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs) があります。すべてのサイズと、どの構成で何が動くか:
 [docs/MODELS.md](docs/MODELS.md)。
 
