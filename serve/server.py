@@ -3775,12 +3775,15 @@ def allowed_ids(req: dict) -> list:
     return [x for x in ids if isinstance(x, int) and not isinstance(x, bool) and x >= 0]
 
 
-def check_logprobs(req: dict, svc, max_req: int) -> None:
-    """The checks a logprobs request passes before anything is sent (chat and legacy completions alike)."""
+def check_logprobs(req: dict, svc, max_req: int, kept: bool = True) -> None:
+    """The checks a logprobs request passes before anything is sent (chat and legacy completions alike).
+    `kept`: the reply holds its entries until it ends (not streamed, or a json_schema), so it needs a bound."""
     if top_logprobs(req) is None:
         return
-    if not 0 < max_req <= LOGPROBS_MAX_TOKENS:
-        raise ValueError(f"logprobs: max_tokens (or max_completion_tokens) 1..{LOGPROBS_MAX_TOKENS} is required")
+    if kept and not 0 < max_req <= LOGPROBS_MAX_TOKENS:
+        raise ValueError(f"logprobs: max_tokens (or max_completion_tokens) 1..{LOGPROBS_MAX_TOKENS} is "
+                         f"required when the reply holds its entries until it ends (not streamed, or a "
+                         f"json_schema); a streamed reply takes any length")
     if getattr(svc.engine, "batch", 0):
         # --parallel/--batch: the batched loop prints "BT <slot> <id>" and never calls emit_lp_line, so no
         # LP line ever reaches the server there (src/program/generate.cpp).  Refused rather than answered
@@ -3801,8 +3804,10 @@ def check_logprobs(req: dict, svc, max_req: int) -> None:
 NO_LINE = object()                                   # StrataEngine.generate: no line held after a token
 
 # A reply with logprobs keeps every entry (its token, bytes and up to 20 alternatives) until it ends when it is not
-# streamed or answers a json_schema, and spell() matches text against the entries still pending: a bounded reply
-# keeps that memory and work bounded.
+# streamed or answers a json_schema (structured_chunks buffers it to validate), and spell() matches text against the
+# entries still pending: a bounded reply keeps that memory and work bounded.  A streamed reply hands each entry out
+# with its chunk and drops it, so it is bounded by the reply's own length and needs no such cap -- the same reason
+# OpenAI itself only bounds a reply by the model's context.
 LOGPROBS_MAX_TOKENS = 4096
 
 
@@ -7517,7 +7522,8 @@ def make_handler(svc: Service):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
-            check_logprobs(req, svc, max_req)
+            kept = not req.get("stream") or validator is not None    # its entries are held until the reply ends
+            check_logprobs(req, svc, max_req, kept)
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
