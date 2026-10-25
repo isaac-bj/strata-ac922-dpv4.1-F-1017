@@ -20,6 +20,9 @@ and their limits. Report what you actually measured and label estimates separate
 
 ## Community reports
 
+- [2026-10-25: RTX 5090, Ryzen 9 9950X, Windows, Q2_0 and IQ3_S (Asaad AlSharif)](../bench/results/2026-10-25-community-rtx-5090-9950x-asaad-q2-iq3s/README.md):
+  Strata 0.2.5 official release / engine 0.1.50, 131,072 context, one slot, vision off; fresh draft-standard runs, three repetitions per performance case and 12/12 sanity checks for each quantization. Includes raw data and separate historical Q2_0 quick/standard/browser observations; not a global ranking.
+
 - [2026-09-30: RTX 5090, Core Ultra 9 285K, 64 GB RAM](../bench/results/2026-09-30-community-rtx-5090/README.md):
   Strata 0.1.29, original Flash-Next IQ2_XS, 131,072-token context; three runs
   each at 4,096, 32,768, and 128,000 prompt tokens, plus six recall checks.

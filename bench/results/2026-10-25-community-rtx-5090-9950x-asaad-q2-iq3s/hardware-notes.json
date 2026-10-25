@@ -1,0 +1,25 @@
+{
+  "capturedAtUtc": "2026-10-25T16:44:49.7856657Z",
+  "processor": [
+    {
+      "Name": "AMD Ryzen 9 9950X 16-Core Processor            ",
+      "NumberOfCores": 16,
+      "NumberOfLogicalProcessors": 32
+    }
+  ],
+  "installedDimmGiB": 96,
+  "osVisibleGiB": 79.672,
+  "dimms": [
+    {
+      "DeviceLocator": "DIMM 1",
+      "CapacityGiB": 48,
+      "ConfiguredClockSpeed": 6000
+    },
+    {
+      "DeviceLocator": "DIMM 1",
+      "CapacityGiB": 48,
+      "ConfiguredClockSpeed": 6000
+    }
+  ],
+  "source": "Windows CIM snapshot on the same machine; benchmark hardware fields are also preserved in each native result."
+}

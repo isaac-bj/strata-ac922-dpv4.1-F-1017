@@ -1,0 +1,19 @@
+{
+  "startedAtUtc": "2026-10-25T17:22:55.560Z",
+  "url": "http://127.0.0.1:18180/",
+  "passed": true,
+  "pageErrors": [],
+  "turns": [
+    {
+      "prompt": "Reply with exactly the following text and nothing else: STRATA_BROWSER_OK",
+      "reply": "STRATA_BROWSER_OK",
+      "elapsedSeconds": 83.788
+    },
+    {
+      "prompt": "احسب 17 ضرب 23. أجب بالعدد فقط، دون شرح.",
+      "reply": "391",
+      "elapsedSeconds": 0.533
+    }
+  ],
+  "completedAtUtc": "2026-10-25T17:24:20.303Z"
+}
