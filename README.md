@@ -198,6 +198,9 @@ On a 16 GB AMD card (RX 9070 XT, 47 GB RAM):
 A token is about ¾ of a word, so 60 tokens per second is faster than you can read. "Reads your prompt" is how fast Strata
 takes in a long document, code or chat history.
 
+Developers: an [experimental Muse Spark reference CLI](docs/MUSE_SPARK.md) can be built separately. It is
+not an installer/chat-server model, and does not establish full 816B checkpoint performance.
+
 ## Using it
 
 ### In the app
