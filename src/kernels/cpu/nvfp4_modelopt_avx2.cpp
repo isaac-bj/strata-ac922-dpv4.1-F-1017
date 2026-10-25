@@ -155,7 +155,7 @@ inline void nvfp4_row_dot_avx2(const uint8_t* wp, const uint8_t* sp,
 }
 
 template <int NT>
-void gu_tile32_nt_avx2(CpuExpertJob& jb, int r0) {
+void gu_tile32_nt_avx2(CpuExpertJob& jb, int r0, int t0) {
     const uint8_t* gw_base = jb.exp_base + EXP_OFF_GATE_W + static_cast<size_t>(r0) * 1280;
     const uint8_t* gs_base = jb.exp_base + EXP_OFF_GATE_S + static_cast<size_t>(r0) * 160;
     const uint8_t* uw_base = jb.exp_base + EXP_OFF_UP_W + static_cast<size_t>(r0) * 1280;
@@ -164,14 +164,14 @@ void gu_tile32_nt_avx2(CpuExpertJob& jb, int r0) {
     alignas(64) float g_all[32][NT];
     for (int r = 0; r < 32; ++r) {
         nvfp4_row_dot_avx2<NT, 160>(gw_base + static_cast<size_t>(r) * 1280, gs_base + static_cast<size_t>(r) * 160,
-                                    jb.q_x, jb.d_x, jb.neg_bias_x, g_all[r]);
+                                    jb.q_x + t0, jb.d_x + t0, jb.neg_bias_x + t0, g_all[r]);
     }
 
     alignas(64) float h32[NT][32];
     for (int r = 0; r < 32; ++r) {
         float u_f32[NT];
         nvfp4_row_dot_avx2<NT, 160>(uw_base + static_cast<size_t>(r) * 1280, us_base + static_cast<size_t>(r) * 160,
-                                    jb.q_x, jb.d_x, jb.neg_bias_x, u_f32);
+                                    jb.q_x + t0, jb.d_x + t0, jb.neg_bias_x + t0, u_f32);
         for (int t = 0; t < NT; ++t) {
             float gf = bf16_bits_to_f32(f32_to_bf16_bits(g_all[r][t] * jb.gate_s2));
             float uf = bf16_bits_to_f32(f32_to_bf16_bits(u_f32[t] * jb.up_s2));
@@ -181,12 +181,12 @@ void gu_tile32_nt_avx2(CpuExpertJob& jb, int r0) {
     }
     int b0 = r0 / 16;
     for (int t = 0; t < NT; ++t) {
-        quantize_act_f32_32_avx2(h32[t], jb.q_h[t] + r0, jb.d_h[t] + b0, jb.neg_bias_h[t] + 4 * b0);
+        quantize_act_f32_32_avx2(h32[t], jb.q_h[t0 + t] + r0, jb.d_h[t0 + t] + b0, jb.neg_bias_h[t0 + t] + 4 * b0);
     }
 }
 
 template <int NT>
-void down_tile80_nt_avx2(CpuExpertJob& jb, int r0) {
+void down_tile80_nt_avx2(CpuExpertJob& jb, int r0, int t0) {
     const uint8_t* dw_base = jb.exp_base + EXP_OFF_DOWN_W + static_cast<size_t>(r0) * 320;
     const uint8_t* ds_base = jb.exp_base + EXP_OFF_DOWN_S + static_cast<size_t>(r0) * 40;
 
@@ -194,9 +194,9 @@ void down_tile80_nt_avx2(CpuExpertJob& jb, int r0) {
     const float* d_h_ptrs[NT];
     const int32_t* nb_h_ptrs[NT];
     for (int t = 0; t < NT; ++t) {
-        q_h_ptrs[t] = jb.q_h[t];
-        d_h_ptrs[t] = jb.d_h[t];
-        nb_h_ptrs[t] = jb.neg_bias_h[t];
+        q_h_ptrs[t] = jb.q_h[t0 + t];
+        d_h_ptrs[t] = jb.d_h[t0 + t];
+        nb_h_ptrs[t] = jb.neg_bias_h[t0 + t];
     }
 
     for (int r = 0; r < 80; ++r) {
@@ -204,7 +204,7 @@ void down_tile80_nt_avx2(CpuExpertJob& jb, int r0) {
         nvfp4_row_dot_avx2<NT, 40>(dw_base + static_cast<size_t>(r) * 320, ds_base + static_cast<size_t>(r) * 40,
                                    q_h_ptrs, d_h_ptrs, nb_h_ptrs, d_f32);
         for (int t = 0; t < NT; ++t) {
-            jb.y_out[t][r0 + r] = f32_to_bf16_bits(d_f32[t] * jb.down_s2);
+            jb.y_out[t0 + t][r0 + r] = f32_to_bf16_bits(d_f32[t] * jb.down_s2);
         }
     }
 }
@@ -243,20 +243,26 @@ void quantize_act_bf16_2560_avx2(const uint16_t* x_bf16, int8_t* q_x, float* d_x
 }
 
 void gu_tile32_modelopt_avx2(CpuExpertJob& jb, int r0) {
-    switch (jb.nt) {
-        case 1: gu_tile32_nt_avx2<1>(jb, r0); break;
-        case 2: gu_tile32_nt_avx2<2>(jb, r0); break;
-        case 3: gu_tile32_nt_avx2<3>(jb, r0); break;
-        default: gu_tile32_nt_avx2<4>(jb, r0); break;
+    for (int t0 = 0; t0 < jb.nt; t0 += 4) {
+        int rem = jb.nt - t0;
+        switch (rem) {
+            case 1: gu_tile32_nt_avx2<1>(jb, r0, t0); break;
+            case 2: gu_tile32_nt_avx2<2>(jb, r0, t0); break;
+            case 3: gu_tile32_nt_avx2<3>(jb, r0, t0); break;
+            default: gu_tile32_nt_avx2<4>(jb, r0, t0); break;
+        }
     }
 }
 
 void down_tile80_modelopt_avx2(CpuExpertJob& jb, int r0) {
-    switch (jb.nt) {
-        case 1: down_tile80_nt_avx2<1>(jb, r0); break;
-        case 2: down_tile80_nt_avx2<2>(jb, r0); break;
-        case 3: down_tile80_nt_avx2<3>(jb, r0); break;
-        default: down_tile80_nt_avx2<4>(jb, r0); break;
+    for (int t0 = 0; t0 < jb.nt; t0 += 4) {
+        int rem = jb.nt - t0;
+        switch (rem) {
+            case 1: down_tile80_nt_avx2<1>(jb, r0, t0); break;
+            case 2: down_tile80_nt_avx2<2>(jb, r0, t0); break;
+            case 3: down_tile80_nt_avx2<3>(jb, r0, t0); break;
+            default: down_tile80_nt_avx2<4>(jb, r0, t0); break;
+        }
     }
 }
 

@@ -22,7 +22,7 @@ inline constexpr size_t EXP_OFF_DOWN_S = 2662400;
 inline constexpr size_t EXP_STRIDE_BYTES = 2764800;
 inline constexpr size_t LAYER_EXPERT_BYTES = 512ULL * EXP_STRIDE_BYTES;   // 1,415,577,600 B
 
-inline constexpr int kMaxJobToks = 4;
+inline constexpr int kMaxJobToks = 64;
 
 struct CpuExpertJob {
     const uint8_t* exp_base = nullptr;

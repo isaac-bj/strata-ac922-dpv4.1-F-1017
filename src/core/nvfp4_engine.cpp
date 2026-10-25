@@ -83,7 +83,7 @@ Qwen4ExpGfx1201Engine::Qwen4ExpGfx1201Engine(std::string model_dir, std::string 
       rope_auto_yarn_(rope_auto_yarn) {
     vram_cap_ = std::min(max_seq_, kv_resident_);
     vram_prefix_ = (max_seq_ > vram_cap_) ? (vram_cap_ - 4096) : vram_cap_;
-    vram_blocks_ = vram_cap_ / 4;
+    vram_blocks_ = strata::core::vmm_available() ? max_blocks_ : (vram_cap_ / 4);
 }
 
 Qwen4ExpGfx1201Engine::~Qwen4ExpGfx1201Engine() {
@@ -632,11 +632,9 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
             int32_t b_start = pos0 / 4;
             int32_t b_end = (pos0 + M) / 4;
             int32_t b_cnt = b_end - b_start;
-            if (b_cnt > 0) {
-                void* args[] = {&rkc, &lw.qsa.idx_k_ln, &d_rope_cos_bf16_, &d_rope_sin_bf16_, &bkc,
-                                &bk_delta, &b_start, &b_cnt, &vram_blocks_, &eps};
-                kernels_.launch("qsa_block_keys_tiered", (b_cnt + 3) / 4, 1, 1, args);
-            }
+            strata::kernels::launch_nvfp4_qsa_block_keys_from_batch(
+                rkc, d_qsa_idx_qk_b_, lw.qsa.idx_k_ln, d_rope_cos_bf16_, d_rope_sin_bf16_,
+                bkc, bk_delta, pos0, M, b_start, b_cnt, vram_blocks_, eps, nullptr);
             if (pos0 + M > 2048) {
                 int32_t t_first = std::max(0, 2048 - pos0);
                 int32_t max_nb = (pos0 + M) / 4;
@@ -648,11 +646,10 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                     int32_t pos_cur = pos0 + t0;
                     void* qk_cur = static_cast<uint16_t*>(d_qsa_idx_qk_b_) + static_cast<size_t>(t0) * 640;
                     void* sel_cur = static_cast<int32_t*>(d_qsa_sel_ids_) + static_cast<size_t>(t0) * 512;
-                    void* asc[] = {&qk_cur, &lw.qsa.idx_q_ln, &d_rope_cos_bf16_, &d_rope_sin_bf16_,
-                                   &bkc, &d_qsa_scores_, &bk_delta, &pos_cur, &vram_blocks_, &score_stride, &eps};
-                    kernels_.launch("qsa_score_blocks_tiered", score_grid, m_cur, 1, asc);
-                    strata::kernels::launch_nvfp4_qsa_pin_sink_and_window(
-                        static_cast<float*>(d_qsa_scores_), pos_cur, m_cur, score_stride, 16, 64, nullptr);
+                    strata::kernels::launch_nvfp4_qsa_score_blocks_batched(
+                        qk_cur, lw.qsa.idx_q_ln, d_rope_cos_bf16_, d_rope_sin_bf16_,
+                        bkc, static_cast<float*>(d_qsa_scores_), bk_delta, pos_cur, m_cur,
+                        vram_blocks_, score_stride, 16, 64, eps, nullptr);
                     void* atk[] = {&d_qsa_scores_, &sel_cur, &pos_cur, &score_stride};
                     kernels_.launch("qsa_topk_blocks", m_cur, 1, 1, atk);
                 }
@@ -889,9 +886,9 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
 
 void Qwen4ExpGfx1201Engine::fetch_ple_rows_cached(const int32_t* tokens, const int32_t* prev0s, const int32_t* prev1s,
                                                   int32_t M, uint8_t* h_ple_dst) {
-    uint64_t miss_offs[kMaxBatch * 16];
-    uint8_t* miss_cache_dsts[kMaxBatch * 16];
-    uint8_t* miss_user_dsts[kMaxBatch * 16];
+    uint64_t* miss_offs = ple_miss_offs_.data();
+    uint8_t** miss_cache_dsts = ple_miss_cache_dsts_.data();
+    uint8_t** miss_user_dsts = ple_miss_user_dsts_.data();
     int n_miss = 0;
 
     for (int32_t t = 0; t < M; ++t) {
@@ -1351,11 +1348,9 @@ void Qwen4ExpGfx1201Engine::run_mtp_kv_batch(const int32_t* next_toks, int32_t c
     int32_t b_start = cell0 / 4;
     int32_t b_end = (cell0 + M) / 4;
     int32_t b_cnt = b_end - b_start;
-    if (b_cnt > 0) {
-        void* args[] = {&rkc, &mtp_.qsa.idx_k_ln, &d_rope_cos_bf16_, &d_rope_sin_bf16_, &bkc,
-                        &bk_delta, &b_start, &b_cnt, &vram_blocks_, &eps};
-        kernels_.launch("qsa_block_keys_tiered", (b_cnt + 3) / 4, 1, 1, args);
-    }
+    strata::kernels::launch_nvfp4_qsa_block_keys_from_batch(
+        rkc, d_qsa_idx_qk_b_, mtp_.qsa.idx_k_ln, d_rope_cos_bf16_, d_rope_sin_bf16_,
+        bkc, bk_delta, cell0, M, b_start, b_cnt, vram_blocks_, eps, nullptr);
 }
 
 int32_t Qwen4ExpGfx1201Engine::run_mtp_step_token(int32_t next_tok, int32_t cell, bool from_ring,
@@ -1662,12 +1657,9 @@ int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefi
     int32_t* dst_routed = h_all_routed_ids_.data() + static_cast<size_t>(l) * pairs;
 
     const Nvfp4MoeWeights& mw = layers_[l].moe;
-    struct MissItem {
-        int32_t e;
-        int32_t pair;
-    };
-    MissItem misses[kMaxBatch * 10];
-    bool tok_needed[kMaxBatch]{};
+    MoeMissItem* misses = moe_misses_.data();
+    uint8_t* tok_needed = moe_tok_needed_.data();
+    std::memset(tok_needed, 0, static_cast<size_t>(M));
     int32_t n_miss = 0;
     const bool use_gpu_cold = !is_prefill || use_gpu_cold_cap;
     for (int32_t p = 0; p < pairs; ++p) {
@@ -1683,15 +1675,15 @@ int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefi
         }
         bool on_cpu = !mw.in_vram[e] && (!use_gpu_cold || forced_cpu || !mw.in_gpu_cold[e]);
         if (on_cpu) {
-            misses[n_miss++] = MissItem{e, p};
-            tok_needed[p / 10] = true;
+            misses[n_miss++] = MoeMissItem{e, p};
+            tok_needed[p / 10] = 1;
         }
     }
     n_cpu_exp_acc_ += n_miss;
     if (n_miss == 0) return 0;
 
     if (!is_prefill) {
-        quantize_act_bf16_2560(h_mixed, act_q_[0], act_d_[0], act_nb_[0]);
+        quantize_act_bf16_2560(h_mixed, act_q_, act_d_, act_nb_);
         const float* h_wts = reinterpret_cast<const float*>(h_ids + 10);
         float* h_accum_f32 = reinterpret_cast<float*>(h_cpu_upload_);
         for (int32_t i = 0; i < n_miss; ++i) {
@@ -1704,9 +1696,9 @@ int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefi
             jb.down_s2 = mw.h_s2[e * 3 + 2];
             jb.weight = h_wts[p];
             jb.nt = 1;
-            jb.q_x[0] = act_q_[0];
-            jb.d_x[0] = act_d_[0];
-            jb.neg_bias_x[0] = act_nb_[0];
+            jb.q_x[0] = act_q_;
+            jb.d_x[0] = act_d_;
+            jb.neg_bias_x[0] = act_nb_;
             jb.y_f32 = (n_miss == 1) ? h_accum_f32 : (h_accum_f32 + static_cast<size_t>(i + 1) * 2560);
         }
         cpu_pool_.run_decode_batch(cpu_jobs_.data(), n_miss, h_accum_f32);
@@ -1717,7 +1709,7 @@ int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefi
     }
 
     if (n_miss > 1) {
-        std::sort(misses, misses + n_miss, [](const MissItem& a, const MissItem& b) {
+        std::sort(misses, misses + n_miss, [](const MoeMissItem& a, const MoeMissItem& b) {
             return (a.e != b.e) ? (a.e < b.e) : (a.pair < b.pair);
         });
     }
@@ -1725,12 +1717,14 @@ int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefi
     for (int32_t t = 0; t < M; ++t) {
         if (tok_needed[t]) {
             quantize_act_bf16_2560(h_mixed + static_cast<size_t>(t) * 2560,
-                                   act_q_[t], act_d_[t], act_nb_[t]);
+                                   act_q_ + static_cast<size_t>(t) * 2560,
+                                   act_d_ + static_cast<size_t>(t) * 160,
+                                   act_nb_ + static_cast<size_t>(t) * 640);
         }
     }
 
     uint16_t* h_y_out = reinterpret_cast<uint16_t*>(h_cpu_upload_);
-    int32_t upload_pairs[kMaxBatch * 10];
+    int32_t* upload_pairs = moe_upload_pairs_.data();
     int32_t n_jobs = 0;
     for (int32_t i = 0; i < n_miss;) {
         int32_t e = misses[i].e;
@@ -1743,9 +1737,9 @@ int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefi
         while (i < n_miss && misses[i].e == e && nt < kMaxJobToks) {
             int32_t p = misses[i].pair;
             int32_t t = p / 10;
-            jb.q_x[nt] = act_q_[t];
-            jb.d_x[nt] = act_d_[t];
-            jb.neg_bias_x[nt] = act_nb_[t];
+            jb.q_x[nt] = act_q_ + static_cast<size_t>(t) * 2560;
+            jb.d_x[nt] = act_d_ + static_cast<size_t>(t) * 160;
+            jb.neg_bias_x[nt] = act_nb_ + static_cast<size_t>(t) * 640;
             jb.y_out[nt] = h_y_out + static_cast<size_t>(i) * 2560;
             upload_pairs[i] = p;
             nt++;
@@ -1874,8 +1868,28 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     if (std::getenv("STRATA_NVFP4_TIMING") != nullptr) {
         for (int i = 0; i < 9; ++i) HIP_CHECK(hipEventCreate(&ev_prof_[i]));
     }
-    cpu_jobs_.resize(B * 10);
+    cpu_jobs_.resize(512 + (B * 10) / static_cast<size_t>(kMaxJobToks) + 32);
     h_all_routed_ids_.resize(48 * B * 10, 0);
+    ple_miss_offs_.resize(B * 16);
+    ple_miss_cache_dsts_.resize(B * 16);
+    ple_miss_user_dsts_.resize(B * 16);
+    moe_misses_.resize(B * 10);
+    moe_tok_needed_.resize(B, 0);
+    moe_upload_pairs_.resize(B * 10);
+
+    auto alloc_aligned_host = [&](size_t bytes) -> void* {
+        void* p = nullptr;
+        if (::posix_memalign(&p, 64, bytes) != 0 || !p) {
+            std::fprintf(stderr, "posix_memalign failed for %zu bytes\n", bytes);
+            std::exit(1);
+        }
+        std::memset(p, 0, bytes);
+        host_mallocs_.push_back(p);
+        return p;
+    };
+    act_q_ = static_cast<int8_t*>(alloc_aligned_host(B * 2560 * sizeof(int8_t)));
+    act_d_ = static_cast<float*>(alloc_aligned_host(B * 160 * sizeof(float)));
+    act_nb_ = static_cast<int32_t*>(alloc_aligned_host(B * 640 * sizeof(int32_t)));
 
     d_step_meta_ = gpu_alloc(16 + B * 2560 + B * sizeof(int32_t));
     h_step_meta_ = host_pinned_alloc(16 + B * 2560 + B * sizeof(int32_t));
@@ -1908,12 +1922,47 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     d_final_hidden_ = gpu_alloc(2560 * sizeof(uint16_t));
     d_logits_bf16_ = gpu_alloc(4ULL * 248320 * sizeof(uint16_t));
     d_proj_scratch_ = gpu_alloc(B * 16480 * sizeof(uint16_t));
-
-    d_ple_embed_ = gpu_alloc(B * 2560 * sizeof(uint16_t));
-    d_ple_k_ = gpu_alloc(B * 12800 * sizeof(uint16_t));
-    d_ple_v_ = gpu_alloc(B * 2560 * sizeof(uint16_t));
-    d_ple_gv_ = gpu_alloc(B * 10240 * sizeof(uint16_t));
     d_ple_gvn_ = gpu_alloc(B * 10240 * sizeof(uint16_t));
+
+    // Unified intra-phase scratch arena (aliases mutually exclusive PLE, GDN, QSA, MoE, and MTP pre-FC buffers)
+    auto align256 = [](size_t x) -> size_t { return (x + 255ULL) & ~255ULL; };
+    const size_t max_moe_tiles = (B * 10 + 15) / 16 + 512;
+    const size_t qsa_scores_bytes = std::max<size_t>(4194304, static_cast<size_t>(max_blocks_)) * sizeof(float);
+
+    const size_t ph_ple_bytes = align256(B * 2560 * sizeof(uint16_t)) +
+                                align256(B * 12800 * sizeof(uint16_t)) +
+                                align256(B * 2560 * sizeof(uint16_t)) +
+                                align256(B * 10240 * sizeof(uint16_t));
+    const size_t ph_gdn_bytes = align256(B * 16480 * sizeof(uint16_t)) +
+                                align256(B * 6144 * sizeof(uint16_t));
+    const size_t ph_qsa_bytes = align256(B * 13952 * sizeof(uint16_t)) +
+                                align256(B * 6144 * sizeof(uint16_t)) +
+                                align256(B * 6144 * sizeof(uint16_t)) +
+                                align256(B * 512 * sizeof(int32_t)) +
+                                align256(qsa_scores_bytes);
+    const size_t ph_moe_bytes = align256(B * 640 * sizeof(uint16_t)) +
+                                align256(B * 2560 * sizeof(uint16_t)) +
+                                align256(B * 16 * sizeof(float)) +
+                                align256(max_moe_tiles * 16 * sizeof(int32_t)) +
+                                align256(max_moe_tiles * sizeof(int32_t)) +
+                                align256(max_moe_tiles * 16 * 640 * sizeof(uint16_t)) +
+                                align256(B * 16 * 2560 * sizeof(uint16_t));
+    const size_t ph_mtp_bytes = align256(B * 2560 * sizeof(uint16_t)) +
+                                align256(B * 2560 * sizeof(uint16_t)) +
+                                align256(B * 10240 * sizeof(uint16_t)) +
+                                align256(B * 10240 * sizeof(uint16_t));
+    const size_t phase_arena_bytes = std::max({ph_ple_bytes, ph_gdn_bytes, ph_qsa_bytes, ph_moe_bytes, ph_mtp_bytes});
+    d_phase_arena_ = gpu_alloc(phase_arena_bytes, true);
+    uint8_t* ph_base = static_cast<uint8_t*>(d_phase_arena_);
+
+    // Phase 1: PLE
+    {
+        size_t off = 0;
+        d_ple_embed_ = ph_base + off; off += align256(B * 2560 * sizeof(uint16_t));
+        d_ple_k_ = ph_base + off;     off += align256(B * 12800 * sizeof(uint16_t));
+        d_ple_v_ = ph_base + off;     off += align256(B * 2560 * sizeof(uint16_t));
+        d_ple_gv_ = ph_base + off;    off += align256(B * 10240 * sizeof(uint16_t));
+    }
 
     const size_t ple_conv_bytes = 9 * 10240 * sizeof(uint16_t);
     const size_t gdn_conv_bytes = 3 * 10240 * sizeof(uint16_t);
@@ -1935,14 +1984,18 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     d_ple_conv_state_ = rec_cur;
     rec_cur += ple_conv_bytes;
 
-    d_gdn_qkv_ = gpu_alloc(B * 16480 * sizeof(uint16_t));
+    // Phase 2: GDN
+    {
+        size_t off = 0;
+        d_gdn_qkv_ = ph_base + off; off += align256(B * 16480 * sizeof(uint16_t));
+        d_gdn_out_ = ph_base + off; off += align256(B * 6144 * sizeof(uint16_t));
+    }
     d_gdn_z_ = static_cast<uint16_t*>(d_gdn_qkv_) + 10240;
     d_gdn_a_ = static_cast<uint16_t*>(d_gdn_qkv_) + 16384;
     d_gdn_b_ = static_cast<uint16_t*>(d_gdn_qkv_) + 16432;
     d_gdn_z_b_ = static_cast<uint16_t*>(d_gdn_qkv_) + B * 10240;
     d_gdn_a_b_ = static_cast<uint16_t*>(d_gdn_qkv_) + B * 16384;
     d_gdn_b_b_ = static_cast<uint16_t*>(d_gdn_qkv_) + B * 16432;
-    d_gdn_out_ = gpu_alloc(B * 6144 * sizeof(uint16_t));
     const size_t gdn_verify_layer_bytes = 4ULL * 16480 * sizeof(uint16_t);
     d_gdn_verify_arena_ = gpu_alloc(36ULL * gdn_verify_layer_bytes);
     uint8_t* ver_cur = static_cast<uint8_t*>(d_gdn_verify_arena_);
@@ -1961,16 +2014,21 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
         }
     }
 
-    d_qsa_qg_ = gpu_alloc(B * 13952 * sizeof(uint16_t));
+    // Phase 3: QSA
+    {
+        size_t off = 0;
+        d_qsa_qg_ = ph_base + off;       off += align256(B * 13952 * sizeof(uint16_t));
+        d_qsa_q_ = ph_base + off;        off += align256(B * 6144 * sizeof(uint16_t));
+        d_qsa_attn_raw_ = ph_base + off; off += align256(B * 6144 * sizeof(uint16_t));
+        d_qsa_sel_ids_ = ph_base + off;  off += align256(B * 512 * sizeof(int32_t));
+        d_qsa_scores_ = ph_base + off;   off += align256(qsa_scores_bytes);
+    }
     d_qsa_k_ = static_cast<uint16_t*>(d_qsa_qg_) + 12288;
     d_qsa_v_ = static_cast<uint16_t*>(d_qsa_qg_) + 12800;
     d_qsa_idx_qk_ = static_cast<uint16_t*>(d_qsa_qg_) + 13312;
     d_qsa_k_b_ = static_cast<uint16_t*>(d_qsa_qg_) + B * 12288;
     d_qsa_v_b_ = static_cast<uint16_t*>(d_qsa_qg_) + B * 12800;
     d_qsa_idx_qk_b_ = static_cast<uint16_t*>(d_qsa_qg_) + B * 13312;
-    d_qsa_q_ = gpu_alloc(B * 6144 * sizeof(uint16_t));
-    d_qsa_attn_raw_ = gpu_alloc(B * 6144 * sizeof(uint16_t));
-    d_qsa_sel_ids_ = gpu_alloc(B * 512 * sizeof(int32_t));
     d_zero_mask_ = gpu_alloc(2048 * sizeof(float), true);
     int max_splits = 10;
     d_attn_pm_ = gpu_alloc(24 * max_splits * sizeof(float));
@@ -1991,6 +2049,10 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     const size_t total_kv_vmm_bytes = static_cast<size_t>(kNumQsaCaches) * (2 * vram_kv_stride_bytes_ + vram_bk_stride_bytes_);
 
     kv_vmm_ok_ = strata::core::vmm_available() && kv_vmm_range_.reserve(total_kv_vmm_bytes);
+    if (!kv_vmm_ok_) {
+        vram_blocks_ = vram_cap_ / 4;
+        vram_bk_stride_bytes_ = ((static_cast<size_t>(vram_blocks_) * 128 * sizeof(uint16_t)) + gran - 1) & ~(gran - 1);
+    }
     const int32_t init_vram_seq = kv_grow_ ? std::min<int32_t>(vram_cap_, 6553) : vram_cap_;
     const size_t init_kv_map = ((static_cast<size_t>(init_vram_seq) * 2 * 160) + gran - 1) & ~(gran - 1);
     const size_t init_bk_map = ((static_cast<size_t>(std::min<int32_t>(vram_blocks_, (init_vram_seq + 3) / 4)) * 128 * sizeof(uint16_t)) + gran - 1) & ~(gran - 1);
@@ -2078,26 +2140,34 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
             bk_host_delta_elems_[q] = (reinterpret_cast<int64_t>(hb) - reinterpret_cast<int64_t>(d_block_k_cache_[q])) / 2;
         }
     }
-    d_qsa_scores_ = gpu_alloc(std::max<size_t>(4194304, static_cast<size_t>(max_blocks_)) * sizeof(float), true);
 
     d_sh_gu_ = gpu_alloc(B * 1856 * sizeof(uint16_t), true);
     d_router_logits_ = static_cast<uint16_t*>(d_sh_gu_) + 1280;
     d_sh_scale_ = static_cast<uint16_t*>(d_sh_gu_) + 1792;
-    d_sh_inter_ = gpu_alloc(B * 640 * sizeof(uint16_t));
-    d_sh_out_ = gpu_alloc(B * 2560 * sizeof(uint16_t));
-    d_moe_wts_ = gpu_alloc(B * 16 * sizeof(float));
-    const size_t max_moe_tiles = (B * 10 + 15) / 16 + 512;
-    d_moe_sorted_ = gpu_alloc(max_moe_tiles * 16 * sizeof(int32_t));
-    d_moe_tile_e_ = gpu_alloc(max_moe_tiles * sizeof(int32_t));
-    d_moe_inter_ = gpu_alloc(max_moe_tiles * 16 * 640 * sizeof(uint16_t));
-    d_moe_y_ = gpu_alloc(B * 16 * 2560 * sizeof(uint16_t));
+
+    // Phase 4: MoE
+    {
+        size_t off = 0;
+        d_sh_inter_ = ph_base + off;   off += align256(B * 640 * sizeof(uint16_t));
+        d_sh_out_ = ph_base + off;     off += align256(B * 2560 * sizeof(uint16_t));
+        d_moe_wts_ = ph_base + off;    off += align256(B * 16 * sizeof(float));
+        d_moe_sorted_ = ph_base + off; off += align256(max_moe_tiles * 16 * sizeof(int32_t));
+        d_moe_tile_e_ = ph_base + off; off += align256(max_moe_tiles * sizeof(int32_t));
+        d_moe_inter_ = ph_base + off;  off += align256(max_moe_tiles * 16 * 640 * sizeof(uint16_t));
+        d_moe_y_ = ph_base + off;      off += align256(B * 16 * 2560 * sizeof(uint16_t));
+    }
+
+    // Phase 5: MTP pre-FC
+    {
+        size_t off = 0;
+        d_mtp_emb_norm_ = ph_base + off; off += align256(B * 2560 * sizeof(uint16_t));
+        d_mtp_e2_ = ph_base + off;       off += align256(B * 2560 * sizeof(uint16_t));
+        d_mtp_h_norm_ = ph_base + off;   off += align256(B * 10240 * sizeof(uint16_t));
+        d_mtp_h2_ = ph_base + off;       off += align256(B * 10240 * sizeof(uint16_t));
+    }
 
     d_mtp_r_ring_ = gpu_alloc(static_cast<size_t>(kMtpRingCap) * 10240 * sizeof(uint16_t), true);
     d_mtp_r_state_ = gpu_alloc(10240 * sizeof(uint16_t), true);
-    d_mtp_emb_norm_ = gpu_alloc(B * 2560 * sizeof(uint16_t));
-    d_mtp_e2_ = gpu_alloc(B * 2560 * sizeof(uint16_t));
-    d_mtp_h_norm_ = gpu_alloc(B * 10240 * sizeof(uint16_t));
-    d_mtp_h2_ = gpu_alloc(B * 10240 * sizeof(uint16_t));
     d_argmax_summary_ = gpu_alloc(4 * sizeof(strata::kernels::Nvfp4ArgmaxSummary));
     d_moe_gpu_align_ids_ = gpu_alloc(B * 10 * sizeof(int32_t));
     d_mtp_dvocab_ = static_cast<int32_t*>(gpu_alloc(65536 * sizeof(int32_t), true));
@@ -2314,7 +2384,8 @@ void Qwen4ExpGfx1201Engine::ensure_context_capacity(int32_t needed_seq) {
             }
             vram_kv_mapped_bytes_ = want_kv_bytes;
         }
-
+    }
+    if (kv_vmm_ok_ && vram_bk_mapped_bytes_ < vram_bk_stride_bytes_) {
         int32_t want_vram_blks = std::min<int32_t>(vram_blocks_, (needed_seq + 3) / 4);
         size_t want_bk_bytes = ((static_cast<size_t>(want_vram_blks) * 128 * sizeof(uint16_t)) + gran - 1) & ~(gran - 1);
         want_bk_bytes = std::min(want_bk_bytes, vram_bk_stride_bytes_);
@@ -2374,7 +2445,7 @@ void Qwen4ExpGfx1201Engine::ensure_context_capacity(int32_t needed_seq) {
 
     int32_t vram_cov = static_cast<int32_t>(std::min<size_t>(vram_prefix_, vram_kv_mapped_bytes_ / 320));
     int32_t host_cov = static_cast<int32_t>(host_kv_mapped_bytes_ / 320);
-    int32_t bk_cov = (vram_blocks_ + static_cast<int32_t>(host_bk_mapped_bytes_ / 256)) * 4;
+    int32_t bk_cov = (static_cast<int32_t>(vram_bk_mapped_bytes_ / 256) + static_cast<int32_t>(host_bk_mapped_bytes_ / 256)) * 4;
     kv_mapped_seq_ = std::min(bk_cov, (host_cov > 0) ? (vram_prefix_ + host_cov) : vram_cov);
 }
 

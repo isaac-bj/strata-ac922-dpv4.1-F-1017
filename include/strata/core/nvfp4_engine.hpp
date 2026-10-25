@@ -167,10 +167,10 @@ public:
     int32_t vram_cap() const { return vram_cap_; }
 
 private:
-    static constexpr int32_t kMaxBatch = 256;
+    static constexpr int32_t kMaxBatch = 4096;
     static constexpr int32_t kNumQsaCaches = 13; // 12 main model QSA layers + 1 MTP QSA layer (index 12)
     static constexpr int32_t kMtpQsaIdx = 12;
-    static constexpr int32_t kMtpRingCap = 512;
+    static constexpr int32_t kMtpRingCap = 4096;
     static constexpr int32_t kMtpRingMask = kMtpRingCap - 1;
 
     int32_t sample_from_device_logits(const Nvfp4SamplingParams& sp,
@@ -309,9 +309,20 @@ private:
     void* h_cpu_upload_ = nullptr;
     std::vector<strata::kernels::cpu::CpuExpertJob> cpu_jobs_;
     std::vector<int32_t> h_all_routed_ids_;
-    alignas(64) int8_t act_q_[kMaxBatch][2560];
-    alignas(64) float act_d_[kMaxBatch][160];
-    alignas(64) int32_t act_nb_[kMaxBatch][640];
+    int8_t* act_q_ = nullptr;
+    float* act_d_ = nullptr;
+    int32_t* act_nb_ = nullptr;
+    std::vector<uint64_t> ple_miss_offs_;
+    std::vector<uint8_t*> ple_miss_cache_dsts_;
+    std::vector<uint8_t*> ple_miss_user_dsts_;
+    struct MoeMissItem {
+        int32_t e;
+        int32_t pair;
+    };
+    std::vector<MoeMissItem> moe_misses_;
+    std::vector<uint8_t> moe_tok_needed_;
+    std::vector<int32_t> moe_upload_pairs_;
+    void* d_phase_arena_ = nullptr;
 
     void* d_step_meta_ = nullptr;
     void* h_step_meta_ = nullptr;

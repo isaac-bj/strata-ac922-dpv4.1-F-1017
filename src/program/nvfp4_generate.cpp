@@ -425,7 +425,7 @@ int run_nvfp4(int argc, char** argv) {
                         cancelled = true;
                         break;
                     }
-                    size_t chunk = std::min<size_t>(256, N - i);
+                    size_t chunk = std::min<size_t>(4080, N - i);
                     std::vector<int32_t> prev0s(chunk);
                     std::vector<int32_t> prev1s(chunk);
                     for (size_t t = 0; t < chunk; ++t) {
@@ -584,6 +584,12 @@ int run_nvfp4(int argc, char** argv) {
                         drafter.observe_step(0, 0, st_ms);
                     }
                 }
+                if (!cancelled) {
+                    if (spec_ngram > 0 && engine.has_mtp()) {
+                        engine.mtp_catchup_kv(history, static_cast<int32_t>(history.size()) - 1);
+                    }
+                    engine.save_turn_ckpt(history, next_tok);
+                }
                 double decode_ms = std::chrono::duration<double, std::milli>(
                                        std::chrono::steady_clock::now() - t_dec0)
                                        .count();
@@ -611,7 +617,7 @@ int run_nvfp4(int argc, char** argv) {
 
     const size_t total_prompt = prompt_ids.size();
     for (size_t i = 0; i < total_prompt;) {
-        size_t chunk = std::min<size_t>(256, total_prompt - i);
+        size_t chunk = std::min<size_t>(4080, total_prompt - i);
         std::vector<int32_t> prev0s(chunk);
         std::vector<int32_t> prev1s(chunk);
         for (size_t t = 0; t < chunk; ++t) {

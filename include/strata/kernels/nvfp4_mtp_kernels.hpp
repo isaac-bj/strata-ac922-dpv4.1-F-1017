@@ -88,4 +88,23 @@ void launch_nvfp4_argmax_prob_margin_dvocab(const void* d_logits_bf16, const int
 void launch_nvfp4_mtp_topk_truncate(int32_t* d_cur_ids, float* d_cur_wts, int32_t keep_k,
                                     hipStream_t stream = nullptr);
 
+// Compute QSA block keys for prefill batches of any size M (up to 4096+) without RAW_K_CACHE 1024-token ring wrap:
+// reads tokens < pos0 from d_raw_k_cache and tokens >= pos0 directly from d_idx_qk_b[(tok - pos0) * 640 + 512],
+// writes block keys to d_block_k_cache (tiered), and refreshes the tail min(M, 4) slots of d_raw_k_cache.
+void launch_nvfp4_qsa_block_keys_from_batch(void* d_raw_k_cache, const void* d_idx_qk_b, const void* d_idx_k_ln,
+                                            const void* d_rope_cos_bf16, const void* d_rope_sin_bf16,
+                                            void* d_block_k_cache, int64_t bk_host_delta_elems,
+                                            int32_t pos0, int32_t M, int32_t b_start, int32_t b_cnt,
+                                            int32_t vram_blocks, float eps, hipStream_t stream = nullptr);
+
+// Batched QSA block-key scorer that tiles up to 8 query tokens per workgroup in LDS (reading each 128-BF16 block key
+// once per 8 query tokens) and fuses NSA initial attention sink + local sliding window pinning.
+void launch_nvfp4_qsa_score_blocks_batched(const void* d_idx_qk_b, const void* d_idx_q_ln,
+                                           const void* d_rope_cos_bf16, const void* d_rope_sin_bf16,
+                                           const void* d_block_k_cache, float* d_scores,
+                                           int64_t bk_host_delta_elems, int32_t pos_cur, int32_t m_cur,
+                                           int32_t vram_blocks, int32_t score_stride,
+                                           int32_t n_sink, int32_t n_local, float eps,
+                                           hipStream_t stream = nullptr);
+
 }  // namespace strata::kernels

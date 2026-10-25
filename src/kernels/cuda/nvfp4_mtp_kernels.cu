@@ -674,6 +674,210 @@ __global__ void nvfp4_mtp_topk_truncate_k(int32_t* __restrict__ cur_ids,
     }
 }
 
+__device__ __forceinline__ float bf_round(float v) {
+    return bf16_to_f32(f32_to_bf16(v));
+}
+
+__device__ __forceinline__ void idx_norm_rope_128(
+    const float vals[4], int lane, const float w4[4],
+    const uint16_t* __restrict__ cos_ptr, const uint16_t* __restrict__ sin_ptr,
+    int32_t pos, float eps, float out[4]) {
+    float ss = vals[0] * vals[0] + vals[1] * vals[1] + vals[2] * vals[2] + vals[3] * vals[3];
+    ss = warp_sum(ss);
+    float rstd = rsqrtf(ss * (1.0f / 128.0f) + eps);
+    float h[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        h[e] = bf_round(vals[e] * rstd * (1.0f + w4[e]));
+    }
+    float partner[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        partner[e] = __shfl_xor_sync(0xffffffffu, h[e], 8, 32);
+    }
+    const bool in_rot = (lane < 16);
+    const bool first = (lane < 8);
+    const int32_t d0 = in_rot ? (lane * 4) : 0;
+    const size_t roff = static_cast<size_t>(pos) * 64ULL + static_cast<size_t>(d0);
+    const uint2 cs2 = *reinterpret_cast<const uint2*>(cos_ptr + roff);
+    const uint2 sn2 = *reinterpret_cast<const uint2*>(sin_ptr + roff);
+    const uint16_t* csu = reinterpret_cast<const uint16_t*>(&cs2);
+    const uint16_t* snu = reinterpret_cast<const uint16_t*>(&sn2);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        float cs = bf16_to_f32(csu[e]);
+        float sn = bf16_to_f32(snu[e]);
+        float rot = first ? -partner[e] : partner[e];
+        float r = bf_round(bf_round(h[e] * cs) + bf_round(rot * sn));
+        out[e] = in_rot ? r : h[e];
+    }
+}
+
+__global__ __launch_bounds__(128) void nvfp4_qsa_block_keys_from_batch_k(
+    uint16_t* __restrict__ rk_ptr,
+    const uint16_t* __restrict__ idx_qk_b,
+    const uint16_t* __restrict__ kw_ptr,
+    const uint16_t* __restrict__ cos_ptr,
+    const uint16_t* __restrict__ sin_ptr,
+    uint16_t* __restrict__ bk_ptr,
+    int64_t bk_host_delta_elems,
+    int32_t pos0, int32_t M,
+    int32_t b_start, int32_t b_cnt,
+    int32_t vram_blocks, float eps) {
+    const int32_t tid = static_cast<int32_t>(threadIdx.x);
+    const int32_t lane = tid & 31;
+    const int32_t wave = tid >> 5;
+    const int32_t i = static_cast<int32_t>(blockIdx.x) * 4 + wave;
+
+    if (i < b_cnt) {
+        const int32_t blk = b_start + i;
+        const int32_t pos = blk * 4;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int32_t tok = pos + r;
+            const uint16_t* src = (tok < pos0)
+                                      ? (rk_ptr + static_cast<size_t>(tok & 1023) * 128ULL + lane * 4)
+                                      : (idx_qk_b + static_cast<size_t>(tok - pos0) * 640ULL + 512ULL + lane * 4);
+            uint2 v2 = *reinterpret_cast<const uint2*>(src);
+            const uint16_t* vu = reinterpret_cast<const uint16_t*>(&v2);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                acc[e] += bf16_to_f32(vu[e]);
+            }
+        }
+        float pooled[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            pooled[e] = bf_round(acc[e] * 0.25f);
+        }
+        uint2 w2 = *reinterpret_cast<const uint2*>(kw_ptr + lane * 4);
+        const uint16_t* wu = reinterpret_cast<const uint16_t*>(&w2);
+        float w4[4] = {bf16_to_f32(wu[0]), bf16_to_f32(wu[1]), bf16_to_f32(wu[2]), bf16_to_f32(wu[3])};
+        float out[4];
+        idx_norm_rope_128(pooled, lane, w4, cos_ptr, sin_ptr, pos, eps, out);
+
+        const bool in_vram = (blk < vram_blocks);
+        const int32_t slot = in_vram ? blk : (blk - vram_blocks);
+        const int64_t bk_off = static_cast<int64_t>(slot) * 128LL + lane * 4 + (in_vram ? 0LL : bk_host_delta_elems);
+        uint16_t out_u16[4] = {f32_to_bf16(out[0]), f32_to_bf16(out[1]), f32_to_bf16(out[2]), f32_to_bf16(out[3])};
+        *reinterpret_cast<uint2*>(bk_ptr + bk_off) = *reinterpret_cast<const uint2*>(out_u16);
+    }
+
+    // Deterministically refresh the last min(M, 4) slots of RAW_K_CACHE from idx_qk_b
+    // so any subsequent prefill chunk or decode step sees exact unpooled keys even when M > 1024.
+    if (blockIdx.x == 0 && M > 0) {
+        const int32_t t_tail_start = (M > 4) ? (M - 4) : 0;
+        for (int32_t t = t_tail_start; t < M; ++t) {
+            const int32_t rk_slot = (pos0 + t) & 1023;
+            rk_ptr[rk_slot * 128 + tid] = idx_qk_b[static_cast<size_t>(t) * 640ULL + 512ULL + tid];
+        }
+    }
+}
+
+__global__ __launch_bounds__(256) void nvfp4_qsa_score_blocks_batched_k(
+    const uint16_t* __restrict__ qk_ptr,
+    const uint16_t* __restrict__ qw_ptr,
+    const uint16_t* __restrict__ cos_ptr,
+    const uint16_t* __restrict__ sin_ptr,
+    const uint16_t* __restrict__ bk_ptr,
+    float* __restrict__ scores_ptr,
+    int64_t bk_host_delta_elems,
+    int32_t pos_cur, int32_t m_cur,
+    int32_t vram_blocks, int32_t score_stride,
+    int32_t n_sink, int32_t n_local, float eps) {
+    __shared__ float q_s[8][512];
+
+    const int32_t tid = static_cast<int32_t>(threadIdx.x);
+    const int32_t wave = tid >> 5;   // 0..7 -> 1 wave per query token in the 8-token tile
+    const int32_t lane = tid & 31;
+    const int32_t t_base = static_cast<int32_t>(blockIdx.y) * 8;
+    const int32_t k_cnt = (t_base + 8 <= m_cur) ? 8 : (m_cur - t_base);
+
+    if (wave < k_cnt) {
+        const int32_t t_rel = t_base + wave;
+        const int32_t pos_t = pos_cur + t_rel;
+        const uint16_t* qk_row = qk_ptr + static_cast<size_t>(t_rel) * 640ULL;
+        uint2 w2 = *reinterpret_cast<const uint2*>(qw_ptr + lane * 4);
+        const uint16_t* wu = reinterpret_cast<const uint16_t*>(&w2);
+        float w4[4] = {bf16_to_f32(wu[0]), bf16_to_f32(wu[1]), bf16_to_f32(wu[2]), bf16_to_f32(wu[3])};
+#pragma unroll
+        for (int h = 0; h < 4; ++h) {
+            const int32_t hq = h * 128 + lane * 4;
+            uint2 q2 = *reinterpret_cast<const uint2*>(qk_row + hq);
+            const uint16_t* qu = reinterpret_cast<const uint16_t*>(&q2);
+            float qv[4] = {bf16_to_f32(qu[0]), bf16_to_f32(qu[1]), bf16_to_f32(qu[2]), bf16_to_f32(qu[3])};
+            float qn[4];
+            idx_norm_rope_128(qv, lane, w4, cos_ptr, sin_ptr, pos_t, eps, qn);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                q_s[wave][hq + e] = qn[e];
+            }
+        }
+    }
+    __syncthreads();
+
+    const int32_t b = static_cast<int32_t>(blockIdx.x) * 256 + tid;
+    const int32_t max_pos_tile = pos_cur + t_base + k_cnt - 1;
+    const int32_t max_nb_tile = (max_pos_tile + 1) >> 2;
+    if (b >= max_nb_tile) return;
+
+    const bool in_vram = (b < vram_blocks);
+    const int32_t slot = in_vram ? b : (b - vram_blocks);
+    const int64_t kbase = static_cast<int64_t>(slot) * 128LL + (in_vram ? 0LL : bk_host_delta_elems);
+    const uint4* bk4 = reinterpret_cast<const uint4*>(bk_ptr + kbase);
+
+    float dots[8][4];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+#pragma unroll
+        for (int h = 0; h < 4; ++h) {
+            dots[k][h] = 0.0f;
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < 16; ++c) {
+        uint4 pack = bk4[c];
+        const uint16_t* ku = reinterpret_cast<const uint16_t*>(&pack);
+        const int base_d = c * 8;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            float kf = bf16_to_f32(ku[e]);
+            const int d = base_d + e;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                if (k < k_cnt) {
+                    dots[k][0] += q_s[k][d] * kf;
+                    dots[k][1] += q_s[k][128 + d] * kf;
+                    dots[k][2] += q_s[k][256 + d] * kf;
+                    dots[k][3] += q_s[k][384 + d] * kf;
+                }
+            }
+        }
+    }
+
+    static constexpr float kInvSqrt128 = 0.08838834764831845f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k < k_cnt) {
+            const int32_t t_rel = t_base + k;
+            const int32_t nb_k = (pos_cur + t_rel + 1) >> 2;
+            if (b < nb_k) {
+                float sc;
+                if (b < n_sink || b >= nb_k - n_local) {
+                    sc = 1e30f;
+                } else {
+                    sc = (fmaxf(dots[k][0], 0.0f) + fmaxf(dots[k][1], 0.0f) +
+                          fmaxf(dots[k][2], 0.0f) + fmaxf(dots[k][3], 0.0f)) *
+                         kInvSqrt128;
+                }
+                scores_ptr[static_cast<size_t>(t_rel) * static_cast<size_t>(score_stride) + b] = sc;
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void launch_nvfp4_mtp_ring_write(const void* src_x_bf16, void* dst_ring_bf16, int32_t pos0, int32_t ring_mask,
@@ -807,6 +1011,46 @@ void launch_nvfp4_mtp_topk_truncate(int32_t* d_cur_ids, float* d_cur_wts, int32_
                                     hipStream_t stream) {
     if (keep_k <= 0 || keep_k >= 10) return;
     nvfp4_mtp_topk_truncate_k<<<1, 32, 0, stream>>>(d_cur_ids, d_cur_wts, keep_k);
+}
+
+void launch_nvfp4_qsa_block_keys_from_batch(void* d_raw_k_cache, const void* d_idx_qk_b, const void* d_idx_k_ln,
+                                            const void* d_rope_cos_bf16, const void* d_rope_sin_bf16,
+                                            void* d_block_k_cache, int64_t bk_host_delta_elems,
+                                            int32_t pos0, int32_t M, int32_t b_start, int32_t b_cnt,
+                                            int32_t vram_blocks, float eps, hipStream_t stream) {
+    if (b_cnt <= 0 && M <= 0) return;
+    uint32_t grid_x = static_cast<uint32_t>(std::max(1, (b_cnt + 3) / 4));
+    nvfp4_qsa_block_keys_from_batch_k<<<grid_x, 128, 0, stream>>>(
+        static_cast<uint16_t*>(d_raw_k_cache),
+        static_cast<const uint16_t*>(d_idx_qk_b),
+        static_cast<const uint16_t*>(d_idx_k_ln),
+        static_cast<const uint16_t*>(d_rope_cos_bf16),
+        static_cast<const uint16_t*>(d_rope_sin_bf16),
+        static_cast<uint16_t*>(d_block_k_cache),
+        bk_host_delta_elems, pos0, M, b_start, b_cnt, vram_blocks, eps);
+}
+
+void launch_nvfp4_qsa_score_blocks_batched(const void* d_idx_qk_b, const void* d_idx_q_ln,
+                                           const void* d_rope_cos_bf16, const void* d_rope_sin_bf16,
+                                           const void* d_block_k_cache, float* d_scores,
+                                           int64_t bk_host_delta_elems, int32_t pos_cur, int32_t m_cur,
+                                           int32_t vram_blocks, int32_t score_stride,
+                                           int32_t n_sink, int32_t n_local, float eps,
+                                           hipStream_t stream) {
+    if (m_cur <= 0) return;
+    int32_t max_nb = (pos_cur + m_cur) / 4;
+    uint32_t score_grid = static_cast<uint32_t>(std::max(1, (max_nb + 255) / 256));
+    uint32_t tok_tiles = static_cast<uint32_t>((m_cur + 7) / 8);
+    dim3 grid(score_grid, tok_tiles, 1);
+    dim3 block(256, 1, 1);
+    nvfp4_qsa_score_blocks_batched_k<<<grid, block, 0, stream>>>(
+        static_cast<const uint16_t*>(d_idx_qk_b),
+        static_cast<const uint16_t*>(d_idx_q_ln),
+        static_cast<const uint16_t*>(d_rope_cos_bf16),
+        static_cast<const uint16_t*>(d_rope_sin_bf16),
+        static_cast<const uint16_t*>(d_block_k_cache),
+        d_scores, bk_host_delta_elems, pos_cur, m_cur,
+        vram_blocks, score_stride, n_sink, n_local, eps);
 }
 
 }  // namespace strata::kernels
