@@ -31,6 +31,12 @@ function readJson(path,fallback={}){try{return JSON.parse(readFileSync(path,'utf
 
 /** The plain words for "no usable engine": the model still downloads, but loading needs the engine (owner decision 2026-10-18). */
 export const ENGINE_NOT_RECOGNISED='Strata didn’t recognise an engine for this computer. The model is downloaded, but it can’t run until the right engine is installed. Open Settings → Engine.';
+/** The environment for the server this host starts from a source checkout. The run config carries this instance's API key, so an inherited STRATA_API_KEY must not override it - and a present-but-empty value is refused outright by serve/server.py (#213), which is why the variable is removed rather than set to "". */
+export function sourceServerEnvironment(base = process.env) {
+  const env = { ...base, PYTHONUNBUFFERED: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' };
+  delete env.STRATA_API_KEY;
+  return env;
+}
 export function createNativeControl({directory,requests=()=>[],changed=()=>{},spawnProcess=spawn,fetcher=fetch,modelsDirectory,nativeDataDirectory=value=>value,beforeLoad=async()=>{},hardwareProbe=()=>[],control=null,ready=null,appUpdater=null,defaultRepo=process.env.STRATA_NATIVE_REPO??resolve(ROOT,'../../Strata')}={}){
  mkdirSync(directory,{recursive:true});
  const settingsPath=join(directory,'native-host.json');
@@ -328,7 +334,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
     try{await startWith(retryConfig);append(id,'Strata Control reports the engine is ready (second try).');}
     catch(second){const said2=humanStartError(second);instance.status='error';instance.error=said2;/* the first stop and the second try stay in job.details; the pop-up shows the last stop once */emit();throw new Error(instance.error);}}}
   } else {
-  proc=spawnProcess(py,[join(repo(),'serve/server.py'),'--engine','strata','--config',configPath,'--port',String(cfg.port),'--host','127.0.0.1'],{cwd:repo(),detached:process.platform!=='win32',stdio:['ignore','pipe','pipe'],env:{...process.env,PYTHONUNBUFFERED:'1',PYTHONUTF8:'1',PYTHONIOENCODING:'utf-8',STRATA_API_KEY:''}});
+  proc=spawnProcess(py,[join(repo(),'serve/server.py'),'--engine','strata','--config',configPath,'--port',String(cfg.port),'--host','127.0.0.1'],{cwd:repo(),detached:process.platform!=='win32',stdio:['ignore','pipe','pipe'],env:sourceServerEnvironment()});
   instances.set(id,instance);processes.set(id,proc);if(!defaultId||!args.multiple||wasDefault)defaultId=id;
   for(const stream of [proc.stdout,proc.stderr])stream.on('data',chunk=>{const lines=chunk.toString().split('\n').filter(Boolean);lines.forEach(line=>append(id,line.replaceAll(key,'[redacted]')));job.summary=lines.at(-1)??job.summary;emit();});
   proc.on('error',error=>{instance.status='error';instance.error=error.message;emit();});proc.on('exit',code=>{if(instances.has(id)&&instance.status!=='unloading'){instance.status='error';instance.error=`Engine stopped${code===null?'':` (exit ${code})`}. Open diagnostics or reload.`;emit();}});emit();
