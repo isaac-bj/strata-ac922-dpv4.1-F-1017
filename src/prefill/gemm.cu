@@ -1320,25 +1320,25 @@ bool Gemm::native_mmvq(const uint16_t* X, int ggml_type, const void* W_blocks, f
         const char* v = std::getenv("STRATA_PF_MMVQ_MAX_T");
         return v ? std::max<int64_t>(1, std::atoll(v)) : (int64_t) 256;   // the gfx906 turn sweep: 256 helps, 512+ slows ~480-token chunks
     }();
-    if (!on || T < 1 || T > max_t || beta != 0.0f || (ldx != 0 && ldx != K) || (ldy != 0 && ldy != N) || N < 1 ||
-        K < 1 || !strata::kernels::native_mmvq_supported(ggml_type) || K % pf_mmvq_block(ggml_type) != 0)
+    if (!on || mmvq_failed_ || T < 1 || T > max_t || beta != 0.0f || (ldx != 0 && ldx != K) || (ldy != 0 && ldy != N) ||
+        N < 1 || K < 1 || !strata::kernels::native_mmvq_supported(ggml_type) || K % pf_mmvq_block(ggml_type) != 0)
         return false;
+    // one workspace of the fixed cap, allocated at the first use and never grown: growing would free it (a device-wide
+    // sync) in the middle of a prompt.  A failed allocation turns the path off for this Gemm (no retry per projection).
     constexpr size_t kCap = 16u << 20;
+    if (!mmvq_buf_) {
+        if (cudaMalloc(&mmvq_buf_, kCap) != cudaSuccess) {
+            (void) cudaGetLastError();
+            mmvq_buf_ = nullptr;
+            mmvq_failed_ = true;
+            return false;
+        }
+        mmvq_bytes_ = kCap;
+    }
     const size_t per_tok = (size_t) K * 4 + strata::kernels::native_q8_1_bytes((int) K, 1);
-    const int64_t slice = std::min<int64_t>({T, 256, (int64_t) (kCap / per_tok)});
+    const int64_t slice = std::min<int64_t>({T, 256, (int64_t) ((kCap - 256) / per_tok)});
     if (slice < 1) return false;
     const size_t f32_bytes = ((size_t) slice * K * 4 + 255) & ~(size_t) 255;
-    const size_t need = f32_bytes + strata::kernels::native_q8_1_bytes((int) (slice * K), 1);
-    if (mmvq_bytes_ < need) {
-        if (mmvq_buf_) {
-            (void) cudaStreamSynchronize((cudaStream_t) stream_);   // an earlier product on this stream may still read it
-            cudaFree(mmvq_buf_);
-        }
-        mmvq_buf_ = nullptr;
-        mmvq_bytes_ = 0;
-        if (cudaMalloc(&mmvq_buf_, need) != cudaSuccess) { (void) cudaGetLastError(); mmvq_buf_ = nullptr; return false; }
-        mmvq_bytes_ = need;
-    }
     float* const xf = static_cast<float*>(mmvq_buf_);
     uint8_t* const xq = static_cast<uint8_t*>(mmvq_buf_) + f32_bytes;
     const size_t q_col = strata::kernels::native_q8_1_bytes((int) K, 1);

@@ -113,8 +113,9 @@ private:
     int64_t unpadded_x_elems_ = 0;
     void* mmq_ctx_ = nullptr;
     void* mmq_buf_ = nullptr;
-    void* mmvq_buf_ = nullptr;      // native_mmvq: an FP32 slice of X and its Q8_1 blocks (at most 16 MiB)
+    void* mmvq_buf_ = nullptr;      // native_mmvq: an FP32 slice of X and its Q8_1 blocks (16 MiB, allocated once)
     size_t mmvq_bytes_ = 0;
+    bool mmvq_failed_ = false;      // the workspace could not be allocated: the path stays off for this Gemm
     bool mmq_failed_ = false;
     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
     void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);

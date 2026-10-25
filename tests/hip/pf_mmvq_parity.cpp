@@ -115,6 +115,21 @@ int main() {
         declines("T above STRATA_PF_MMVQ_MAX_T", MAX_T + 1, K, 0, 0.0f);
         if (type != GGML_TYPE_Q8_0) declines("K = 640 (not a 256 multiple)", 8, 640, 0, 0.0f);
     }
+    // the workspace is allocated once at its fixed size: a larger chunk later must not grow (free + cudaMalloc, a device
+    // sync mid-prompt) - device memory stays the same between a 1-token and a 512-token call on a fresh Gemm
+    {
+        strata::prefill::Gemm g2;
+        if (!g2.init(st, N * K, err)) { std::printf("FAIL: init 2: %s\n", err.c_str()); return 1; }
+        size_t f0 = 0, f1 = 0, tot = 0;
+        expect(g2.native_mmvq(dX, GGML_TYPE_Q8_0, dW, dY, 1, N, K, 0, 0.0f, 0), "workspace: T=1 declined");
+        ck(cudaStreamSynchronize(st), "sync");
+        ck(cudaMemGetInfo(&f0, &tot), "meminfo");
+        expect(g2.native_mmvq(dX, GGML_TYPE_Q8_0, dW, dY, MAX_T, N, K, 0, 0.0f, 0), "workspace: T=512 declined");
+        ck(cudaStreamSynchronize(st), "sync");
+        ck(cudaMemGetInfo(&f1, &tot), "meminfo");
+        std::printf("workspace: free %zu -> %zu MiB\n", f0 >> 20, f1 >> 20);
+        expect(f0 == f1, "workspace grew between a 1-token and a 512-token call");
+    }
     // a type without a native MMVQ kernel (BF16) is declined
     expect(!gm.native_mmvq(dX, GGML_TYPE_BF16, dW, dY, 8, N, K, 0, 0.0f, 0), "BF16: taken");
     std::printf(fails ? "FAILED: %d\n" : "PASS\n", fails);
