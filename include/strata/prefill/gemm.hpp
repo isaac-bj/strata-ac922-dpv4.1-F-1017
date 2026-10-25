@@ -58,7 +58,7 @@ public:
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
 
-    /// STRATA_PF_MMVQ=1 (opt-in): native()'s product for a small chunk (T <= STRATA_PF_MMVQ_MAX_T, default 512) through
+    /// STRATA_PF_MMVQ=1 (opt-in): native()'s product for a small chunk (T <= STRATA_PF_MMVQ_MAX_T, default 256) through
     /// decode's native MMVQ on the GGUF blocks, 8 token columns per call, the activations through Q8_1 - no dequantized
     /// weight, no GEMM.  Only beta = 0, contiguous X and Y (ldx 0 or K, ldy 0 or N), a type native_mmvq_supported()
     /// takes and a K that is a whole number of its blocks.  true: Y written; false: declined, nothing written.

@@ -1318,7 +1318,7 @@ bool Gemm::native_mmvq(const uint16_t* X, int ggml_type, const void* W_blocks, f
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_MMVQ"); return v && v[0] == '1'; }();
     static const int64_t max_t = [] {
         const char* v = std::getenv("STRATA_PF_MMVQ_MAX_T");
-        return v ? std::max<int64_t>(1, std::atoll(v)) : (int64_t) 512;
+        return v ? std::max<int64_t>(1, std::atoll(v)) : (int64_t) 256;   // the gfx906 turn sweep: 256 helps, 512+ slows ~480-token chunks
     }();
     if (!on || T < 1 || T > max_t || beta != 0.0f || (ldx != 0 && ldx != K) || (ldy != 0 && ldy != N) || N < 1 ||
         K < 1 || !strata::kernels::native_mmvq_supported(ggml_type) || K % pf_mmvq_block(ggml_type) != 0)
