@@ -99,6 +99,7 @@ strata launch --show-key
 | `--gpu LIST`, `--gpu-roles LIST` | Which cards to use, and a role per card. |
 | `--tune quick\|thorough\|skip`, `--tune-allow-small`, `--retune` | Tuning. `--retune` measures again; a model tuned before for the same choices on this computer reuses the stored result. |
 | `--set KEY=VALUE` | An advanced engine setting or `STRATA_*` variable (repeatable). Unknown names get a warning. |
+| `--vram-reserve-mib MIB` | Graphics memory to leave free for other programs. Use `0` or a positive whole number of MiB. |
 | `--pool-cores LIST` | Experimental: pin CPU workers to these logical processors, for example `2-14:2` ([DETAILS.md](DETAILS.md)). |
 | `--access local\|lan\|cloudflare\|tailscale`, `--port N` | Who can reach the server. |
 | `--api-key KEY`, `--api-key-env NAME`, `--new-key`, `--no-api-key` | The key clients must send. |

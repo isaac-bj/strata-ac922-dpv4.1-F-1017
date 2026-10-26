@@ -771,7 +771,7 @@ class FlagsCommand(unittest.TestCase):
         code, out, err = run_cli(["launch", "--help"])
         self.assertEqual(code, 0)
         for flag in ("--preset", "--model", "--family", "--model-path", "--data-dir", "--context", "--kv", "--vision", "--parallel", "--gpu",
-                     "--tune", "--tune-allow-small", "--set", "--access", "--port", "--api-key", "--api-key-env", "--new-key", "--save-preset",
+                     "--tune", "--tune-allow-small", "--set", "--vram-reserve-mib", "--access", "--port", "--api-key", "--api-key-env", "--new-key", "--save-preset",
                      "--no-tui", "--plan", "--feed", "--list-presets", "--delete-preset", "--status", "--stop", "--show-key", "examples:"):
             self.assertIn(flag, out)
         code, out, _ = run_cli(["--help"])
@@ -817,6 +817,20 @@ class FlagsCommand(unittest.TestCase):
         self.assertEqual((s["family"], s["kv"], s["gpus"], s["data_dir"], s["tune_allow_small"]), ("swift", "q4_0", [0, 1], str(self.home.base / "data-x"), True))
         self.assertEqual(s["extra"], {"--prefill": "65536", "STRATA_PIN_BY_NEED": "1"})
         self.assertIn("--set prefill=65536", p["flags"])
+
+    def test_vram_reserve_flag_is_planned_and_copyable(self):
+        p = self.plan("--model", "q2_0", "--vram-reserve-mib", "2048")
+        self.assertEqual(p["settings"]["extra"]["--vram-reserve-mib"], "2048")
+        self.assertIn("--set vram-reserve-mib=2048", p["flags"])
+        from strata_control import tune_knobs
+        cfg = derive_config({"args": ["--vram-reserve-mib", "700"], "env": {}},
+                            S.LaunchSettings(extra=p["settings"]["extra"]), bool_flags=tune_knobs.BOOL_FLAGS)
+        self.assertEqual(cfg["args"], ["--vram-reserve-mib", "2048"])
+        p = self.plan("--model", "q2_0", "--set", "vram-reserve-mib=700", "--vram-reserve-mib", "0")
+        self.assertEqual(p["settings"]["extra"]["--vram-reserve-mib"], "0")
+        code, _, err = run_cli(["launch", "--plan", "--vram-reserve-mib", "-1"])
+        self.assertEqual(code, 2)
+        self.assertIn("below zero", err)
 
     def test_pool_cores_is_an_experimental_advanced_setting(self):
         code, out, err = run_cli(["launch", "--help"])

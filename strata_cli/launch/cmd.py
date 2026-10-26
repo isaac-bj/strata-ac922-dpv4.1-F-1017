@@ -72,6 +72,16 @@ def _parallel(value: str) -> int:
     return p
 
 
+def _mib(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{value}' is not a MiB value. Use a whole number of MiB, for example 2048.") from None
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"{n} MiB is below zero. Use 0 or a positive whole number of MiB.")
+    return n
+
+
 def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]:
     p = sp.add_parser(
         "launch", help="guided setup, serve and monitor (the screens), or the same with flags", epilog=EXAMPLES,
@@ -116,6 +126,8 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     g.add_argument("--tune-allow-small", action="store_true", help="let the tuner also try settings that can change answers very slightly")
     g.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                    help="an advanced engine setting or STRATA_* variable, e.g. prefill=65536 (repeat); unknown names get a warning, not a refusal")
+    g.add_argument("--vram-reserve-mib", type=_mib, metavar="MIB",
+                   help="graphics memory to leave free for other programs (0 or a positive whole number of MiB)")
     g.add_argument("--pool-cores", metavar="LIST",
                    help="experimental: pin the CPU workers to exactly these logical processors, e.g. 2,4,6,8 or 2-14:2 (the numbers Task Manager or "
                         "lscpu show). The default is one worker per physical core, which the engine's start line names; "
@@ -279,6 +291,8 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.no_key = False
     if a.set:
         s.extra = {**s.extra, **S.settings_from_pairs(a.set)}
+    if a.vram_reserve_mib is not None:
+        s.extra = {**s.extra, "--vram-reserve-mib": str(a.vram_reserve_mib)}
     if a.pool_cores:
         text = a.pool_cores.replace(" ", "")
         if not re.fullmatch(r"\d+(-\d+(:\d+)?)?(,\d+(-\d+(:\d+)?)?)*", text):
