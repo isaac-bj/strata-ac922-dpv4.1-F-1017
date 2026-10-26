@@ -21,7 +21,8 @@ void init_cpu_isa() {
                            __builtin_cpu_supports("avx512bw") &&
                            __builtin_cpu_supports("avx512vl") &&
                            __builtin_cpu_supports("avx512dq") &&
-                           __builtin_cpu_supports("avx512vnni");
+                           __builtin_cpu_supports("avx512vnni") &&
+                           __builtin_cpu_supports("avx512bf16");
     if (const char* force_avx2 = std::getenv("STRATA_FORCE_AVX2")) {
         if (std::atoi(force_avx2) != 0) g_cpu_has_avx512vnni = false;
     }
@@ -82,8 +83,8 @@ void quantize_act_bf16_2560(const uint16_t* x_bf16, int8_t* q_x, float* d_x, int
 void Nvfp4CpuPool::init() {
     if (inited_) return;
     init_cpu_isa();
-    std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
-    int n = static_cast<int>(cores.size());
+    cores_ = strata::kernels::cpu::physical_cores(false);
+    int n = static_cast<int>(cores_.size());
     if (n <= 0) {
         n = static_cast<int>(std::max(1u, std::thread::hardware_concurrency() / 2));
     }
@@ -92,15 +93,20 @@ void Nvfp4CpuPool::init() {
         if (req >= 1) n = req;
     }
     n_threads_ = n;
-    if (!cores.empty()) {
-        strata::kernels::cpu::pin_current_thread(cores[0]);
-    }
     workers_.reserve(n_threads_ - 1);
     for (int t = 1; t < n_threads_; ++t) {
-        int cpu = (t < static_cast<int>(cores.size())) ? cores[t] : -1;
+        int cpu = (t < static_cast<int>(cores_.size())) ? cores_[t] : -1;
         workers_.emplace_back([this, cpu]() { worker_loop(cpu); });
     }
     inited_ = true;
+}
+
+void Nvfp4CpuPool::ensure_host_pinned() {
+    thread_local bool tls_pinned = false;
+    if (!tls_pinned && !cores_.empty() && cores_[0] >= 0) {
+        strata::kernels::cpu::pin_current_thread(cores_[0]);
+        tls_pinned = true;
+    }
 }
 
 void Nvfp4CpuPool::stop() {
@@ -137,14 +143,16 @@ void Nvfp4CpuPool::run_decode_batch(CpuExpertJob* jobs, int n_jobs, float* y_acc
     // Phase 4: 32 tiles of 80 down rows per expert (writing pre-weighted float32 into jb.y_f32)
     launch_phase(4, n_jobs, 32);
 
-    if (n_jobs > 1) {
-        const float* src0 = jobs[0].y_f32;
-        for (int c = 0; c < 2560; ++c) {
-            float sum = src0[c];
-            for (int j = 1; j < n_jobs; ++j) {
-                sum += jobs[j].y_f32[c];
+    if (n_jobs >= 1) {
+        if (y_accum_f32 != jobs[0].y_f32) {
+            std::copy_n(jobs[0].y_f32, 2560, y_accum_f32);
+        }
+        for (int j = 1; j < n_jobs; ++j) {
+            const float* src = jobs[j].y_f32;
+#pragma GCC ivdep
+            for (int c = 0; c < 2560; ++c) {
+                y_accum_f32[c] += src[c];
             }
-            y_accum_f32[c] = sum;
         }
     }
 }
@@ -160,14 +168,16 @@ void Nvfp4CpuPool::run_mtp_decode_batch(CpuExpertJob* jobs, int n_jobs, float* y
     // Phase 7: 32 tiles of 80 FP8 down rows per expert (writing pre-weighted float32 into jb.y_f32)
     launch_phase(7, n_jobs, 32);
 
-    if (n_jobs > 1) {
-        const float* src0 = jobs[0].y_f32;
-        for (int c = 0; c < 2560; ++c) {
-            float sum = src0[c];
-            for (int j = 1; j < n_jobs; ++j) {
-                sum += jobs[j].y_f32[c];
+    if (n_jobs >= 1) {
+        if (y_accum_f32 != jobs[0].y_f32) {
+            std::copy_n(jobs[0].y_f32, 2560, y_accum_f32);
+        }
+        for (int j = 1; j < n_jobs; ++j) {
+            const float* src = jobs[j].y_f32;
+#pragma GCC ivdep
+            for (int c = 0; c < 2560; ++c) {
+                y_accum_f32[c] += src[c];
             }
-            y_accum_f32[c] = sum;
         }
     }
 }
@@ -178,6 +188,30 @@ void Nvfp4CpuPool::run_ple_reads(int fd, const uint64_t* offsets, uint8_t* const
     ple_offsets_ = offsets;
     ple_dsts_ = dsts;
     launch_phase(5, n_reads, 1);
+}
+
+void Nvfp4CpuPool::run_quantize_batch(const uint16_t* h_mixed, const uint8_t* tok_needed,
+                                      int8_t* act_q, float* act_d, int32_t* act_nb, int n_toks) {
+    if (n_toks <= 0) return;
+    if (n_toks <= 32 || n_threads_ <= 1) {
+        for (int t = 0; t < n_toks; ++t) {
+            if (tok_needed[t]) {
+                quantize_act_bf16_2560(h_mixed + static_cast<size_t>(t) * 2560,
+                                       act_q + static_cast<size_t>(t) * 2560,
+                                       act_d + static_cast<size_t>(t) * 160,
+                                       act_nb + static_cast<size_t>(t) * 640);
+            }
+        }
+        return;
+    }
+    q_h_mixed_ = h_mixed;
+    q_tok_needed_ = tok_needed;
+    q_act_q_ = act_q;
+    q_act_d_ = act_d;
+    q_act_nb_ = act_nb;
+    q_n_toks_ = n_toks;
+    const int n_chunks = (n_toks + 3) / 4;
+    launch_phase(8, n_chunks, 1);
 }
 
 void Nvfp4CpuPool::launch_phase(int ph, int n_jobs, int tiles_per_job) {
@@ -204,6 +238,29 @@ void Nvfp4CpuPool::do_work() {
             int idx = next_task_.fetch_add(1, std::memory_order_relaxed);
             if (idx >= total) break;
             strata::artifact::pread_exact(fd, dsts[idx], 160, offs[idx]);
+        }
+        return;
+    }
+    if (ph == 8) {
+        const uint16_t* h_mixed = q_h_mixed_;
+        const uint8_t* tok_needed = q_tok_needed_;
+        int8_t* act_q = q_act_q_;
+        float* act_d = q_act_d_;
+        int32_t* act_nb = q_act_nb_;
+        const int n_toks = q_n_toks_;
+        while (true) {
+            int idx = next_task_.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= total) break;
+            const int t0 = idx * 4;
+            const int t1 = std::min(n_toks, t0 + 4);
+            for (int t = t0; t < t1; ++t) {
+                if (tok_needed[t]) {
+                    quantize_act_bf16_2560(h_mixed + static_cast<size_t>(t) * 2560,
+                                           act_q + static_cast<size_t>(t) * 2560,
+                                           act_d + static_cast<size_t>(t) * 160,
+                                           act_nb + static_cast<size_t>(t) * 640);
+                }
+            }
         }
         return;
     }

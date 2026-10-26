@@ -162,22 +162,50 @@ void Nvfp4NgramDrafter::observe_target_confidence(float prob, float margin) {
     last_target_margin_ = std::max(0.0f, margin);
 }
 
+double Nvfp4NgramDrafter::estimate_verify_ms(int32_t drafted) const {
+    const double t_base = std::max(5.0, ema_step_ms_[0]);
+    if (drafted <= 0) return t_base;
+    // Physical cost floor & ceiling relative to current-context base latency t_base:
+    // fixed batch-verification setup (1.13x) + marginal per-token cost (0.040x)
+    // + extra 16-row LM-head pass every 16 tokens (0.05x * (drafted / 16)).
+    const double min_ver = t_base * (1.13 + 0.040 * static_cast<double>(drafted) +
+                                     0.05 * static_cast<double>(drafted / 16));
+    const double max_ver = t_base * (1.28 + 0.062 * static_cast<double>(drafted) +
+                                     0.06 * static_cast<double>(drafted / 16));
+    if (static_cast<size_t>(drafted) < ema_step_ms_.size() &&
+        ema_step_ms_[static_cast<size_t>(drafted)] > 0.0) {
+        return std::clamp(ema_step_ms_[static_cast<size_t>(drafted)], min_ver, max_ver);
+    }
+    return min_ver;
+}
+
 void Nvfp4NgramDrafter::observe_step(int32_t drafted, int32_t accepted, double step_ms) {
-    if (step_ms >= 5.0 && step_ms <= 200.0) {
+    if (step_ms >= 5.0 && step_ms <= 300.0) {
         if (drafted == 0) {
             ema_step_ms_[0] = 0.85 * ema_step_ms_[0] + 0.15 * step_ms;
-            for (size_t k = 1; k <= 3; ++k) {
-                const double min_ver = ema_step_ms_[0] * (1.18 + 0.05 * static_cast<double>(k));
+            for (size_t k = 1; k < ema_step_ms_.size(); ++k) {
+                const double min_ver = estimate_verify_ms(static_cast<int32_t>(k));
                 if (ema_step_ms_[k] < min_ver) ema_step_ms_[k] = min_ver;
             }
-        } else if (drafted >= 1 && drafted <= 3) {
+        } else if (drafted >= 1) {
+            while (ema_step_ms_.size() <= static_cast<size_t>(drafted)) {
+                int32_t next_k = static_cast<int32_t>(ema_step_ms_.size());
+                ema_step_ms_.push_back(estimate_verify_ms(next_k));
+            }
+            const double factor = 1.13 + 0.040 * static_cast<double>(drafted) +
+                                  0.05 * static_cast<double>(drafted / 16);
             if (accepted == drafted) {
-                // Full acceptance: zero GDN rollback occurred, direct measurement of T_verify(1 + drafted)
+                // Full acceptance: zero GDN rollback occurred, direct measurement of T_verify(1 + drafted).
+                // Also update ema_step_ms_[0] so base latency tracks context growth when MTP handles fallback steps.
+                const double implied_base = std::clamp(step_ms / factor, 12.0, 60.0);
+                ema_step_ms_[0] = 0.88 * ema_step_ms_[0] + 0.12 * implied_base;
                 ema_step_ms_[static_cast<size_t>(drafted)] =
                     0.80 * ema_step_ms_[static_cast<size_t>(drafted)] + 0.20 * step_ms;
             } else {
                 // Partial/zero acceptance: step_ms includes GDN recurrent state restore + replay
                 double est_verify = std::max(ema_step_ms_[0] * 1.20, step_ms - ema_rollback_ms_);
+                const double implied_base = std::clamp(est_verify / factor, 12.0, 60.0);
+                ema_step_ms_[0] = 0.92 * ema_step_ms_[0] + 0.08 * implied_base;
                 ema_step_ms_[static_cast<size_t>(drafted)] =
                     0.85 * ema_step_ms_[static_cast<size_t>(drafted)] + 0.15 * est_verify;
             }
@@ -187,8 +215,9 @@ void Nvfp4NgramDrafter::observe_step(int32_t drafted, int32_t accepted, double s
     // DSpark causal prefix survival calibration (Eq. 11):
     // Update empirical survival probability only for positions up to the first rejected draft token.
     if (drafted >= 1 && drafted == last_draft_len_) {
-        const int32_t tested = std::min(drafted, accepted + 1);
-        for (int32_t j = 0; j < tested && j < 3; ++j) {
+        const int32_t tested = std::min<int32_t>(
+            {drafted, accepted + 1, static_cast<int32_t>(last_draft_buckets_.size())});
+        for (int32_t j = 0; j < tested; ++j) {
             const int32_t b = std::clamp(last_draft_buckets_[static_cast<size_t>(j)], 0, 4);
             const double survived = (j < accepted) ? 1.0 : 0.0;
             bucket_emp_survival_[static_cast<size_t>(b)] =
@@ -258,7 +287,8 @@ double Nvfp4NgramDrafter::estimate_step_confidence(const StepStats& st, int32_t 
     return std::clamp(conf, 0.0, 0.99);
 }
 
-int32_t Nvfp4NgramDrafter::schedule_prefix(const StepStats* steps, int32_t num_cand) const {
+int32_t Nvfp4NgramDrafter::schedule_prefix(const std::vector<StepStats>& steps) const {
+    const int32_t num_cand = static_cast<int32_t>(steps.size());
     if (num_cand <= 0) return 0;
 
     // DSpark Algorithm 1: Hardware-Aware Prefix Length Scheduler
@@ -278,14 +308,13 @@ int32_t Nvfp4NgramDrafter::schedule_prefix(const StepStats* steps, int32_t num_c
 
     double a_l = 1.0;
     double expected_adv = 1.0;
-    for (int32_t l = 1; l <= num_cand && l <= 3; ++l) {
-        const double c_l = steps[l - 1].confidence;
+    for (int32_t l = 1; l <= num_cand; ++l) {
+        const double c_l = steps[static_cast<size_t>(l - 1)].confidence;
         if (c_l <= 0.0) break;
         a_l *= c_l;
         expected_adv += a_l;
 
-        const double min_ver = t_base * (1.18 + 0.05 * static_cast<double>(l));
-        const double t_ver = std::max(min_ver, ema_step_ms_[static_cast<size_t>(l)]);
+        const double t_ver = estimate_verify_ms(l);
         const double expected_cost = t_ver + (1.0 - a_l) * ema_rollback_ms_;
         const double theta_l = expected_adv / expected_cost;
 
@@ -335,10 +364,10 @@ void Nvfp4NgramDrafter::draft(int32_t cur_tok, size_t prompt_len, const std::vec
             break;
         }
 
-        int total1 = 0, total2 = 0, total3 = 0, total4 = 0;
-        int agree1 = 0, agree2 = 0, agree3 = 0, agree4 = 0;
-        int runner1 = 0, runner2 = 0, runner3 = 0;
-        int32_t c1 = -1, c2 = -1, c3 = -1, c4 = -1;
+        std::vector<int32_t> cands;
+        std::vector<int> totals;
+        std::vector<int> agrees;
+        std::vector<int> runners;
         int32_t best_match_L = L;
 
         const size_t min_i = std::max(static_cast<size_t>(L - 1), cur_digit_run);
@@ -372,59 +401,70 @@ void Nvfp4NgramDrafter::draft(int32_t cur_tok, size_t prompt_len, const std::vec
                         }
                     }
 
-                    total1++;
-                    int32_t cand2 = ((i + 2) < n && history[i + 2] < 248040) ? history[i + 2] : -1;
-                    int32_t cand3 = (cand2 >= 0 && (i + 3) < n && history[i + 3] < 248040) ? history[i + 3] : -1;
-                    int32_t cand4 = (cand3 >= 0 && (i + 4) < n && history[i + 4] < 248040) ? history[i + 4] : -1;
-
-                    if (c1 < 0 || (L == 4 && cur_match_L > best_match_L && cand1 != c1)) {
-                        if (c1 >= 0 && cand1 != c1) {
-                            runner1 = std::max(runner1, agree1);
-                            agree1 = 0;
-                            total2 = agree2 = runner2 = 0;
-                            total3 = agree3 = runner3 = 0;
-                            total4 = agree4 = 0;
+                    if (cands.empty() || (L == 4 && cur_match_L > best_match_L && cand1 != cands[0])) {
+                        int prev_runner0 = 0;
+                        int prev_total0 = 0;
+                        if (!cands.empty()) {
+                            prev_total0 = totals[0];
+                            prev_runner0 = (cand1 != cands[0]) ? std::max(runners[0], agrees[0]) : runners[0];
                         }
-                        c1 = cand1;
-                        c2 = cand2;
-                        c3 = cand3;
-                        c4 = cand4;
+                        cands.assign(1, cand1);
+                        totals.assign(1, prev_total0);
+                        agrees.assign(1, 0);
+                        runners.assign(1, prev_runner0);
                         best_match_L = std::max(best_match_L, cur_match_L);
                     }
-                    if (cand1 == c1) {
-                        agree1++;
+
+                    totals[0]++;
+                    if (cand1 == cands[0]) {
+                        agrees[0]++;
                         best_match_L = std::max(best_match_L, cur_match_L);
-                        if (cand2 >= 0) {
-                            if (c2 < 0) c2 = cand2;
-                            total2++;
-                            if (cand2 == c2) {
-                                agree2++;
-                                if (cand3 >= 0) {
-                                    if (c3 < 0) c3 = cand3;
-                                    total3++;
-                                    if (cand3 == c3) {
-                                        agree3++;
-                                        if (cand4 >= 0) {
-                                            if (c4 < 0) c4 = cand4;
-                                            total4++;
-                                            if (cand4 == c4) agree4++;
-                                        }
-                                    } else {
-                                        runner3++;
-                                    }
+                        const bool can_grow = (cands.size() == 1);
+                        const size_t max_ext = 28;
+                        for (size_t s = 1; (i + 1 + s) < n && s < max_ext; ++s) {
+                            int32_t cs = history[i + 1 + s];
+                            if (cs < 0 || cs >= 248040) break;
+                            if (s == cands.size()) {
+                                if (!can_grow) break;
+                                int32_t p2 = (s == 1) ? w3 : cands[s - 2];
+                                int32_t p1 = cands[s - 1];
+                                if (is_rejected(p2, p1, cs) || is_new_number_head(p2, p1, cs)) break;
+                                int32_t cs_next_peek = ((i + 2 + s) < n && history[i + 2 + s] < 248040)
+                                                           ? history[i + 2 + s]
+                                                           : -1;
+                                if (L < 4 && is_clause_break(cs, cs_next_peek)) break;
+                                if (L <= 2 && !is_subword_cont(p1, cs, cs_next_peek) &&
+                                    !is_entity_or_num(cs) && !is_digit_tok(cs) &&
+                                    !(s == 1 && is_content_token(cs))) {
+                                    break;
                                 }
+                                cands.push_back(cs);
+                                totals.push_back(0);
+                                agrees.push_back(0);
+                                runners.push_back(0);
+                            }
+                            totals[s]++;
+                            if (cs == cands[s]) {
+                                agrees[s]++;
                             } else {
-                                runner2++;
+                                runners[s]++;
+                                break;
                             }
                         }
                     } else {
-                        runner1++;
+                        runners[0]++;
                     }
                 }
             }
             if (i == min_i) break;
         }
-        if (total1 == 0 || c1 < 0) continue;
+        if (cands.empty() || totals[0] == 0 || cands[0] < 0) continue;
+
+        const int32_t c1 = cands[0];
+        const int32_t c2 = (cands.size() > 1) ? cands[1] : -1;
+        const int total1 = totals[0];
+        const int agree1 = agrees[0];
+        const int runner1 = runners[0];
 
         if (L >= 3 || (L == 2 && total1 >= 2)) {
             matched_higher_order = true;
@@ -455,8 +495,17 @@ void Nvfp4NgramDrafter::draft(int32_t cur_tok, size_t prompt_len, const std::vec
             return (ck_next >= 0 && tot_next > 0 && ag_next == tot_next && !is_new_number_head(prev_t, ck, ck_next));
         };
 
-        StepStats steps[3]{};
-        int32_t num_cand = 0;
+        auto cand_at = [&](size_t idx) -> int32_t {
+            return (idx < cands.size()) ? cands[idx] : -1;
+        };
+        auto tot_at = [&](size_t idx) -> int {
+            return (idx < totals.size()) ? totals[idx] : 0;
+        };
+        auto agr_at = [&](size_t idx) -> int {
+            return (idx < agrees.size()) ? agrees[idx] : 0;
+        };
+
+        std::vector<StepStats> steps;
         const int32_t base_bucket = (best_match_L >= 5) ? 4 : (L - 1);
 
         if (L == 4) {
@@ -464,79 +513,93 @@ void Nvfp4NgramDrafter::draft(int32_t cur_tok, size_t prompt_len, const std::vec
             if (is_clause_break(c1, c2) && agree1 < 2 && best_match_L < 6) continue;
             if (agree1 <= runner1) continue;
 
-            steps[0] = {c1, agree1, total1, runner1, best_match_L, base_bucket, 0.0};
-            steps[0].confidence = estimate_step_confidence(steps[0], w2, w3, c2);
-            num_cand = 1;
+            StepStats st0{c1, agree1, total1, runner1, best_match_L, base_bucket, 0.0};
+            st0.confidence = estimate_step_confidence(st0, w2, w3, c2);
+            steps.push_back(st0);
 
-            if (c2 >= 0 && total2 > 0 && agree2 > runner2 && !is_rejected(w3, c1, c2) &&
-                !is_new_number_head(w3, c1, c2) &&
-                (!is_clause_break(c2, c3) || best_match_L >= 5 || agree2 >= 2)) {
-                steps[1] = {c2, agree2, total2, runner2, best_match_L + 1, std::min(4, base_bucket + 1), 0.0};
-                steps[1].confidence = estimate_step_confidence(steps[1], w3, c1, c3);
-                num_cand = 2;
-
-                if (c3 >= 0 && total3 > 0 && agree3 > runner3 && !is_rejected(c1, c2, c3) &&
-                    !is_new_number_head(c1, c2, c3) &&
-                    (!is_clause_break(c3, c4) || best_match_L >= 6 || agree3 >= 2)) {
-                    steps[2] = {c3, agree3, total3, runner3, best_match_L + 2, std::min(4, base_bucket + 1), 0.0};
-                    steps[2].confidence = estimate_step_confidence(steps[2], c1, c2, c4);
-                    num_cand = 3;
-                }
+            for (size_t s = 1; s < cands.size(); ++s) {
+                int32_t cs = cands[s];
+                int32_t cs_next = cand_at(s + 1);
+                int32_t prev1 = cands[s - 1];
+                int32_t prev2 = (s == 1) ? w3 : cands[s - 2];
+                int tot_s = totals[s];
+                int agr_s = agrees[s];
+                int run_s = runners[s];
+                int32_t eff_L = best_match_L + static_cast<int32_t>(s);
+                if (cs < 0 || tot_s <= 0 || agr_s <= run_s) break;
+                if (is_rejected(prev2, prev1, cs) || is_new_number_head(prev2, prev1, cs)) break;
+                if (is_clause_break(cs, cs_next) && eff_L < 6 && agr_s < 2) break;
+                StepStats sts{cs, agr_s, tot_s, run_s, eff_L, std::min(4, base_bucket + 1), 0.0};
+                sts.confidence = estimate_step_confidence(sts, prev2, prev1, cs_next);
+                if (sts.confidence <= 0.0) break;
+                steps.push_back(sts);
             }
         } else if (L == 3) {
             int n_content3 = (is_content_token(w1) ? 1 : 0) + (is_content_token(w2) ? 1 : 0) +
                              (is_content_token(w3) ? 1 : 0);
             bool ok3 = (agree1 == total1) && !is_clause_break(c1, c2) && !is_new_number_head(w2, w3, c1) &&
-                       space_ok(c1, c2, agree2, total2, w3) &&
+                       space_ok(c1, c2, agr_at(1), tot_at(1), w3) &&
                        (agree1 >= 2 || is_subword_cont(w3, c1, c2) || is_subword_cont(w2, w3, c1) ||
                         is_content_token(c1) || n_content3 >= 2);
             if (ok3) {
-                steps[0] = {c1, agree1, total1, runner1, 3, 2, 0.0};
-                steps[0].confidence = estimate_step_confidence(steps[0], w2, w3, c2);
-                num_cand = 1;
+                StepStats st0{c1, agree1, total1, runner1, 3, 2, 0.0};
+                st0.confidence = estimate_step_confidence(st0, w2, w3, c2);
+                steps.push_back(st0);
 
-                if (c2 >= 0 && total2 > 0 && agree2 == total2 && !is_rejected(w3, c1, c2) &&
-                    !is_clause_break(c2, c3) && !is_new_number_head(w3, c1, c2) &&
-                    space_ok(c2, c3, agree3, total3, c1)) {
-                    steps[1] = {c2, agree2, total2, runner2, 4, 3, 0.0};
-                    steps[1].confidence = estimate_step_confidence(steps[1], w3, c1, c3);
-                    num_cand = 2;
-
-                    if (c3 >= 0 && total3 > 0 && agree3 == total3 && !is_rejected(c1, c2, c3) &&
-                        !is_clause_break(c3, c4) && !is_new_number_head(c1, c2, c3) &&
-                        space_ok(c3, c4, agree4, total4, c2)) {
-                        steps[2] = {c3, agree3, total3, runner3, 5, 4, 0.0};
-                        steps[2].confidence = estimate_step_confidence(steps[2], c1, c2, c4);
-                        num_cand = 3;
+                for (size_t s = 1; s < cands.size(); ++s) {
+                    int32_t cs = cands[s];
+                    int32_t cs_next = cand_at(s + 1);
+                    int32_t prev1 = cands[s - 1];
+                    int32_t prev2 = (s == 1) ? w3 : cands[s - 2];
+                    int tot_s = totals[s];
+                    int agr_s = agrees[s];
+                    int run_s = runners[s];
+                    int32_t eff_L = 3 + static_cast<int32_t>(s);
+                    if (cs < 0 || tot_s <= 0 || agr_s != tot_s) break;
+                    if (is_rejected(prev2, prev1, cs) || is_clause_break(cs, cs_next) ||
+                        is_new_number_head(prev2, prev1, cs)) {
+                        break;
                     }
+                    if (!space_ok(cs, cs_next, agr_at(s + 1), tot_at(s + 1), prev1)) break;
+                    StepStats sts{cs, agr_s, tot_s, run_s, eff_L, std::min(4, 2 + static_cast<int32_t>(s)), 0.0};
+                    sts.confidence = estimate_step_confidence(sts, prev2, prev1, cs_next);
+                    if (sts.confidence <= 0.0) break;
+                    steps.push_back(sts);
                 }
             }
         } else if (L == 2) {
             bool ok2 = (agree1 == total1) && !is_clause_break(c1, c2) && !is_new_number_head(w2, w3, c1) &&
-                       space_ok(c1, c2, agree2, total2, w3) &&
+                       space_ok(c1, c2, agr_at(1), tot_at(1), w3) &&
                        (is_subword_cont(w3, c1, c2) || is_subword_cont(w2, w3, c1) || is_content_token(w3) ||
                         (is_content_token(w2) && is_content_token(c1)));
             if (ok2) {
-                steps[0] = {c1, agree1, total1, runner1, 2, 1, 0.0};
-                steps[0].confidence = estimate_step_confidence(steps[0], w2, w3, c2);
-                num_cand = 1;
+                StepStats st0{c1, agree1, total1, runner1, 2, 1, 0.0};
+                st0.confidence = estimate_step_confidence(st0, w2, w3, c2);
+                steps.push_back(st0);
 
-                if (c2 >= 0 && total2 > 0 && agree2 == total2 && !is_rejected(w3, c1, c2) &&
-                    !is_clause_break(c2, c3) && !is_new_number_head(w3, c1, c2) &&
-                    space_ok(c2, c3, agree3, total3, c1) &&
-                    (is_subword_cont(c1, c2, c3) || is_content_token(c2) || total1 >= 2)) {
-                    steps[1] = {c2, agree2, total2, runner2, 3, 2, 0.0};
-                    steps[1].confidence = estimate_step_confidence(steps[1], w3, c1, c3);
-                    num_cand = 2;
-
-                    if (c3 >= 0 && total3 > 0 && agree3 == total3 && !is_rejected(c1, c2, c3) &&
-                        !is_clause_break(c3, c4) && !is_new_number_head(c1, c2, c3) &&
-                        space_ok(c3, c4, agree4, total4, c2) &&
-                        (is_subword_cont(c2, c3, c4) || is_entity_or_num(c3) || total1 >= 2)) {
-                        steps[2] = {c3, agree3, total3, runner3, 4, 3, 0.0};
-                        steps[2].confidence = estimate_step_confidence(steps[2], c1, c2, c4);
-                        num_cand = 3;
+                for (size_t s = 1; s < cands.size(); ++s) {
+                    int32_t cs = cands[s];
+                    int32_t cs_next = cand_at(s + 1);
+                    int32_t prev1 = cands[s - 1];
+                    int32_t prev2 = (s == 1) ? w3 : cands[s - 2];
+                    int tot_s = totals[s];
+                    int agr_s = agrees[s];
+                    int run_s = runners[s];
+                    int32_t eff_L = 2 + static_cast<int32_t>(s);
+                    if (cs < 0 || tot_s <= 0 || agr_s != tot_s) break;
+                    if (is_rejected(prev2, prev1, cs) || is_clause_break(cs, cs_next) ||
+                        is_new_number_head(prev2, prev1, cs)) {
+                        break;
                     }
+                    if (!space_ok(cs, cs_next, agr_at(s + 1), tot_at(s + 1), prev1)) break;
+                    bool struct_ok = is_subword_cont(prev1, cs, cs_next) ||
+                                     (s == 1 ? is_content_token(cs) : is_entity_or_num(cs)) ||
+                                     total1 >= 2;
+                    if (!struct_ok) break;
+                    StepStats sts{cs, agr_s, tot_s, run_s, eff_L, std::min(4, 1 + static_cast<int32_t>(s)), 0.0};
+                    sts.confidence = estimate_step_confidence(sts, prev2, prev1, cs_next);
+                    if (sts.confidence <= 0.0) break;
+                    steps.push_back(sts);
                 }
             }
         } else if (L == 1) {
@@ -550,50 +613,50 @@ void Nvfp4NgramDrafter::draft(int32_t cur_tok, size_t prompt_len, const std::vec
             bool w3_ent = is_entity_or_num(w3);
             bool c1_alnum_head = !c1_s.empty() && std::isalnum(static_cast<unsigned char>(c1_s[0]));
 
-            // Subword continuation at L = 1 requires either:
-            // - an entity/numeric/mixed-case stem (e.g. "gfx" -> "1201", "GD" -> "DR"),
-            // - a digit continuation (e.g. "fp" -> "4"),
-            // - repeated consensus in history (agree1 >= 2 with >= 4-char stem and alphanumeric c1), or
-            // - a long specific word root (>= 6 chars) with alphanumeric c1 continuation.
             bool sub1 = is_subword_cont(w3, c1, c2) &&
                         (w3_ent || is_digit_tok(c1) ||
                          (c1_alnum_head && ((agree1 >= 2 && w3_len >= 4) || w3_len >= 6)));
 
-            // Entity/number phrase continuation at L = 1 (e.g. "AMD" -> " Radeon", "R9700" -> " ("):
             bool ent1 = (total1 <= 6) && w3_ent &&
-                        (is_entity_or_num(c1) || (c1_s == " " && space_ok(c1, c2, agree2, total2, w3)));
+                        (is_entity_or_num(c1) || (c1_s == " " && space_ok(c1, c2, agr_at(1), tot_at(1), w3)));
 
             if (agree1 == total1 && !is_clause_break(c1, c2) && !is_new_number_head(w2, w3, c1) &&
-                space_ok(c1, c2, agree2, total2, w3) && (sub1 || ent1)) {
-                steps[0] = {c1, agree1, total1, runner1, 1, 0, 0.0};
-                steps[0].confidence = estimate_step_confidence(steps[0], w2, w3, c2);
-                num_cand = 1;
+                space_ok(c1, c2, agr_at(1), tot_at(1), w3) && (sub1 || ent1)) {
+                StepStats st0{c1, agree1, total1, runner1, 1, 0, 0.0};
+                st0.confidence = estimate_step_confidence(st0, w2, w3, c2);
+                steps.push_back(st0);
 
-                if (c2 >= 0 && total2 > 0 && agree2 == total2 && !is_rejected(w3, c1, c2) &&
-                    !is_clause_break(c2, c3) && !is_new_number_head(w3, c1, c2) &&
-                    space_ok(c2, c3, agree3, total3, c1) &&
-                    (is_subword_cont(c1, c2, c3) || is_entity_or_num(c2) ||
-                     (c1_s == " " && is_digit_tok(c2)))) {
-                    steps[1] = {c2, agree2, total2, runner2, 2, 1, 0.0};
-                    steps[1].confidence = estimate_step_confidence(steps[1], w3, c1, c3);
-                    num_cand = 2;
-
-                    if (c3 >= 0 && total3 > 0 && agree3 == total3 && !is_rejected(c1, c2, c3) &&
-                        !is_clause_break(c3, c4) && !is_new_number_head(c1, c2, c3) &&
-                        space_ok(c3, c4, agree4, total4, c2) &&
-                        (is_subword_cont(c2, c3, c4) || (is_digit_tok(c2) && is_digit_tok(c3)))) {
-                        steps[2] = {c3, agree3, total3, runner3, 3, 2, 0.0};
-                        steps[2].confidence = estimate_step_confidence(steps[2], c1, c2, c4);
-                        num_cand = 3;
+                for (size_t s = 1; s < cands.size(); ++s) {
+                    int32_t cs = cands[s];
+                    int32_t cs_next = cand_at(s + 1);
+                    int32_t prev1 = cands[s - 1];
+                    int32_t prev2 = (s == 1) ? w3 : cands[s - 2];
+                    int tot_s = totals[s];
+                    int agr_s = agrees[s];
+                    int run_s = runners[s];
+                    int32_t eff_L = 1 + static_cast<int32_t>(s);
+                    if (cs < 0 || tot_s <= 0 || agr_s != tot_s) break;
+                    if (is_rejected(prev2, prev1, cs) || is_clause_break(cs, cs_next) ||
+                        is_new_number_head(prev2, prev1, cs)) {
+                        break;
                     }
+                    if (!space_ok(cs, cs_next, agr_at(s + 1), tot_at(s + 1), prev1)) break;
+                    bool cont_ok = is_subword_cont(prev1, cs, cs_next) ||
+                                   (s == 1 && (is_entity_or_num(cs) || (c1_s == " " && is_digit_tok(cs)))) ||
+                                   (is_digit_tok(prev1) && is_digit_tok(cs));
+                    if (!cont_ok) break;
+                    StepStats sts{cs, agr_s, tot_s, run_s, eff_L, std::min(4, static_cast<int32_t>(s)), 0.0};
+                    sts.confidence = estimate_step_confidence(sts, prev2, prev1, cs_next);
+                    if (sts.confidence <= 0.0) break;
+                    steps.push_back(sts);
                 }
             }
         }
 
-        if (num_cand > 0) {
-            int32_t sched_len = schedule_prefix(steps, num_cand);
+        if (!steps.empty()) {
+            int32_t sched_len = schedule_prefix(steps);
             // Never end a draft on a bare space token " "
-            while (sched_len > 0 && get_tok_str(steps[sched_len - 1].cand) == " ") {
+            while (sched_len > 0 && get_tok_str(steps[static_cast<size_t>(sched_len - 1)].cand) == " ") {
                 sched_len--;
             }
             // At L = 1 with only a single occurrence in history (agree1 == 1), require either
@@ -607,9 +670,10 @@ void Nvfp4NgramDrafter::draft(int32_t cur_tok, size_t prompt_len, const std::vec
                 }
             }
             if (sched_len > 0) {
+                last_draft_buckets_.resize(static_cast<size_t>(sched_len));
                 for (int32_t k = 0; k < sched_len; ++k) {
-                    draft_out.push_back(steps[k].cand);
-                    last_draft_buckets_[static_cast<size_t>(k)] = steps[k].bucket;
+                    draft_out.push_back(steps[static_cast<size_t>(k)].cand);
+                    last_draft_buckets_[static_cast<size_t>(k)] = steps[static_cast<size_t>(k)].bucket;
                 }
                 last_draft_len_ = sched_len;
                 return;

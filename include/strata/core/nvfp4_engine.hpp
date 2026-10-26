@@ -65,8 +65,8 @@ struct Nvfp4MoeWeights {
     int32_t slot_exp[64]{};        // Expert ID currently occupying dynamic slot s
     uint32_t slot_last_used[64]{}; // Step counter when dynamic slot s was last used
     uint32_t hit_count[512]{};     // Cumulative routing hits for expert e
-    std::vector<int64_t> h_ptrs;   // Host mirror of d_ptrs [512 * 6]
-    std::vector<int64_t> h_ptrs_prefill; // Host mirror of d_ptrs_prefill [512 * 6]
+    int64_t* h_ptrs = nullptr;          // Pinned host mirror of d_ptrs [512 * 6]
+    int64_t* h_ptrs_prefill = nullptr;  // Pinned host mirror of d_ptrs_prefill [512 * 6]
     std::vector<float> h_s2;       // Host copy of s2 [512 * 3] (gate_s2, up_s2, down_s2)
 };
 
@@ -203,6 +203,7 @@ private:
     strata::core::VmmChunk take_one_dynamic_expert_chunk();
     bool map_kv_vmm_with_reclaim(size_t offset, size_t length);
     void ensure_context_capacity(int32_t needed_seq);
+    void ensure_verify_capacity(int32_t needed_m);
     void load_weights_from_safetensors();
 
     std::string model_dir_;
@@ -278,7 +279,8 @@ private:
     int32_t turn_ckpt_mtp_kv_pos_ = 0;
     float last_target_prob_ = 1.0f;
     float last_target_margin_ = 10.0f;
-    strata::kernels::Nvfp4ArgmaxSummary verify_summaries_[4]{};
+    int32_t verify_cap_ = 0;
+    std::vector<strata::kernels::Nvfp4ArgmaxSummary> verify_summaries_;
     void* d_mtp_r_ring_ = nullptr;
     void* d_mtp_r_state_ = nullptr;
     void* d_mtp_emb_norm_ = nullptr;
@@ -306,6 +308,7 @@ private:
     void* d_route_bell_ = nullptr;
     void* h_route_bell_ = nullptr;
     void* d_cpu_upload_ = nullptr;
+    void* d_cpu_upload_host_dev_ = nullptr;
     void* h_cpu_upload_ = nullptr;
     std::vector<strata::kernels::cpu::CpuExpertJob> cpu_jobs_;
     std::vector<int32_t> h_all_routed_ids_;
@@ -320,6 +323,7 @@ private:
         int32_t pair;
     };
     std::vector<MoeMissItem> moe_misses_;
+    std::vector<MoeMissItem> moe_misses_sorted_;
     std::vector<uint8_t> moe_tok_needed_;
     std::vector<int32_t> moe_upload_pairs_;
     void* d_phase_arena_ = nullptr;
@@ -364,12 +368,14 @@ private:
     void* d_gdn_conv_in_[48]{};
     void* d_gdn_conv_out_[48]{};
     void* d_gdn_state_[48]{};
+    void* d_gdn_state_ckpt_[48]{};
     void* d_recurrent_arena_ = nullptr;
     void* d_recurrent_ckpt_ = nullptr;
     void* d_raw_k_arena_ = nullptr;
     void* h_turn_ckpt_ = nullptr;
     size_t recurrent_arena_bytes_ = 0;
     size_t recurrent_ckpt_bytes_ = 0;
+    size_t conv_ckpt_bytes_ = 0;
     size_t raw_k_arena_bytes_ = 0;
     void* init_gdn_conv_in_[48]{};
     void* init_gdn_conv_out_[48]{};

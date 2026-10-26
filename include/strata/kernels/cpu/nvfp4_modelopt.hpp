@@ -41,6 +41,7 @@ struct CpuExpertJob {
     alignas(64) float d_h[kMaxJobToks][40];
     alignas(64) int32_t neg_bias_h[kMaxJobToks][160];
     alignas(64) float h_f32[640];
+    alignas(64) float y_buf_f32[2560];
 };
 
 // AVX-512 VNNI kernels (defined in src/kernels/cpu/nvfp4_modelopt_avx512.cpp)
@@ -72,10 +73,16 @@ public:
 
     void init();
     void stop();
+    void ensure_host_pinned();
+    int core_for_thread(int t) const {
+        return (t >= 0 && t < static_cast<int>(cores_.size())) ? cores_[t] : -1;
+    }
     void run_batch(CpuExpertJob* jobs, int n_jobs);
     void run_decode_batch(CpuExpertJob* jobs, int n_jobs, float* y_accum_f32);
     void run_mtp_decode_batch(CpuExpertJob* jobs, int n_jobs, float* y_accum_f32);
     void run_ple_reads(int fd, const uint64_t* offsets, uint8_t* const* dsts, int n_reads);
+    void run_quantize_batch(const uint16_t* h_mixed, const uint8_t* tok_needed,
+                            int8_t* act_q, float* act_d, int32_t* act_nb, int n_toks);
 
     int num_threads() const { return n_threads_; }
 
@@ -86,6 +93,7 @@ private:
 
     bool inited_ = false;
     int n_threads_ = 1;
+    std::vector<int> cores_;
     std::vector<std::thread> workers_;
     alignas(64) std::atomic<uint32_t> gen_{0};
     alignas(64) std::atomic<int> next_task_{0};
@@ -95,6 +103,12 @@ private:
     int ple_fd_ = -1;
     const uint64_t* ple_offsets_ = nullptr;
     uint8_t* const* ple_dsts_ = nullptr;
+    const uint16_t* q_h_mixed_ = nullptr;
+    const uint8_t* q_tok_needed_ = nullptr;
+    int8_t* q_act_q_ = nullptr;
+    float* q_act_d_ = nullptr;
+    int32_t* q_act_nb_ = nullptr;
+    int q_n_toks_ = 0;
     int n_jobs_ = 0;
     int n_tasks_ = 0;
     int phase_ = 0;

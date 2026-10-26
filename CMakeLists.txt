@@ -428,8 +428,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_HIP)
     target_sources(strata_kernels PRIVATE
                    src/kernels/cuda/gfx1201_nvfp4_hsaco.cpp
-                   src/kernels/cuda/gfx1201_nvfp4_kernels.cpp
-                   src/kernels/cuda/nvfp4_mtp_kernels.cu)
+                   src/kernels/cuda/gfx1201_nvfp4_kernels.cpp)
   endif()
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,
@@ -1631,8 +1630,10 @@ if(MSVC)
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/nvfp4_modelopt_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 else()
   # GCC/Clang spell it differently, and `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
-  set_source_files_properties(src/kernels/cpu/expert.cpp src/kernels/cpu/nvfp4_modelopt_avx512.cpp
+  set_source_files_properties(src/kernels/cpu/expert.cpp
                               PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+  set_source_files_properties(src/kernels/cpu/nvfp4_modelopt_avx512.cpp
+                              PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mavx512bf16;-mf16c;-mfma")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/nvfp4_modelopt_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 endif()
 # AVX-VNNI (Alder Lake, Sapphire Rapids and later): the AVX-2 expert kernels' vpdpwssd / vpdpbusd copies (q2_avx2.cpp,

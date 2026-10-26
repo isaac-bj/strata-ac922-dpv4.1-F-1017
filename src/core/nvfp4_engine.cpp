@@ -2,6 +2,7 @@
 #include "strata/core/nvfp4_engine.hpp"
 #include "strata/artifact/safetensors_reader.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 
 #include <immintrin.h>
 
@@ -151,6 +152,7 @@ int32_t Qwen4ExpGfx1201Engine::step_token(int32_t token_id, int32_t prev0, int32
                                           const Nvfp4SamplingParams* sp,
                                           const std::vector<int32_t>* history,
                                           std::mt19937_64* rng) {
+    cpu_pool_.ensure_host_pinned();
     ensure_context_capacity(pos + 1);
     int32_t* meta_i32 = static_cast<int32_t*>(h_step_meta_);
     meta_i32[0] = token_id;
@@ -287,13 +289,10 @@ int32_t Qwen4ExpGfx1201Engine::step_token(int32_t token_id, int32_t prev0, int32
                 void* ac[] = {&d_attn_pm_, &d_attn_pl_, &d_attn_pa_, &d_qsa_qg_, &d_qsa_attn_raw_, &splits};
                 kernels_.launch("attn_decode_combine", 24, 1, 1, ac);
             } else {
-                int32_t nb = (pos + 1) / 4;
-                int32_t score_grid = std::max(1, (nb + 255) / 256);
-                void* asc[] = {&d_qsa_idx_qk_, &lw.qsa.idx_q_ln, &d_rope_cos_bf16_, &d_rope_sin_bf16_,
-                               &bkc, &d_qsa_scores_, &bk_delta, &pos, &vram_blocks_, &max_blocks_, &eps};
-                kernels_.launch("qsa_score_blocks_tiered", score_grid, 1, 1, asc);
-                strata::kernels::launch_nvfp4_qsa_pin_sink_and_window(
-                    static_cast<float*>(d_qsa_scores_), pos, 1, max_blocks_, 16, 64, nullptr);
+                strata::kernels::launch_nvfp4_qsa_score_blocks_tiered_pinned(
+                    kernels_, d_qsa_idx_qk_, lw.qsa.idx_q_ln, d_rope_cos_bf16_, d_rope_sin_bf16_,
+                    bkc, static_cast<float*>(d_qsa_scores_), bk_delta, pos, vram_blocks_,
+                    max_blocks_, 16, 64, eps, 1, nullptr);
                 void* atk[] = {&d_qsa_scores_, &d_qsa_sel_ids_, &pos, &max_blocks_};
                 kernels_.launch("qsa_topk_blocks", 1, 1, 1, atk);
                 int32_t splits = 9;
@@ -365,10 +364,9 @@ int32_t Qwen4ExpGfx1201Engine::step_token(int32_t token_id, int32_t prev0, int32
 
     if (!compute_logits) {
         if (mtp_.available) {
-            void* args[] = {&cur_x, &prev_out, &prev_inj, &alt_x};
+            void* final_xo = static_cast<uint16_t*>(d_mtp_r_ring_) + static_cast<size_t>(pos & kMtpRingMask) * 10240;
+            void* args[] = {&cur_x, &prev_out, &prev_inj, &final_xo};
             kernels_.launch_default("hc_residual_add", args);
-            std::swap(cur_x, alt_x);
-            strata::kernels::launch_nvfp4_mtp_ring_write(cur_x, d_mtp_r_ring_, pos, kMtpRingMask, 1, nullptr);
         }
         adapt_vram_experts(h_all_routed_ids_.data(), 1, /*min_hits=*/2, /*max_swaps=*/2);
         t_wait_acc_ms_ = 0.0;
@@ -382,14 +380,13 @@ int32_t Qwen4ExpGfx1201Engine::step_token(int32_t token_id, int32_t prev0, int32
 
     {
         int64_t zero_delta = 0;
-        void* args[] = {&cur_x, &prev_out, &prev_inj, &alt_x, &final_hc_.norm, &final_hc_.down,
+        void* final_xo = mtp_.available
+                             ? (static_cast<uint16_t*>(d_mtp_r_ring_) + static_cast<size_t>(pos & kMtpRingMask) * 10240)
+                             : alt_x;
+        void* args[] = {&cur_x, &prev_out, &prev_inj, &final_xo, &final_hc_.norm, &final_hc_.down,
                         &d_hc_h_, &d_hc_h_, &d_hc_rstd_, &zero_delta, &eps};
         kernels_.launch_default("hc_premix_decode_c0_u1", args);
-        std::swap(cur_x, alt_x);
-        if (mtp_.available) {
-            strata::kernels::launch_nvfp4_mtp_ring_write(cur_x, d_mtp_r_ring_, pos, kMtpRingMask, 1, nullptr);
-        }
-        void* m_args[] = {&cur_x, &final_hc_.norm, &d_hc_rstd_, &d_hc_h_, &final_hc_.up, &d_final_hidden_, &one};
+        void* m_args[] = {&final_xo, &final_hc_.norm, &d_hc_rstd_, &d_hc_h_, &final_hc_.up, &d_final_hidden_, &one};
         kernels_.launch_default("hc_mix_decode", m_args);
     }
 
@@ -399,7 +396,7 @@ int32_t Qwen4ExpGfx1201Engine::step_token(int32_t token_id, int32_t prev0, int32
         kernels_.launch_default("bf16_gemv_248320_2560", a_lm);
         if (!use_sampling) {
             strata::kernels::launch_nvfp4_argmax_prob_margin_248320(
-                d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
+                kernels_, d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
                 static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), 1, nullptr);
         }
     }
@@ -470,7 +467,11 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
     if (M == 1 && !verify_next_toks_out) {
         return step_token(tokens[0], prev0s[0], prev1s[0], pos0, compute_logits, dump_logits_out, sp, history, rng);
     }
+    cpu_pool_.ensure_host_pinned();
     ensure_context_capacity(pos0 + M);
+    if (verify_next_toks_out) {
+        ensure_verify_capacity(M);
+    }
 
     uint8_t* h_ple_rows = static_cast<uint8_t*>(h_step_meta_) + 16;
     uint8_t* h_batch_toks = h_ple_rows + static_cast<size_t>(M) * 2560;
@@ -481,7 +482,6 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
 
     int32_t one = 1;
     float eps = 1e-6f;
-    const int32_t m_tiles16 = (M + 15) / 16;
     const int32_t m_tiles64 = (M + 63) / 64;
     const bool use_wmma_hc = (M >= 16);
     void* d_cur_ids = static_cast<uint8_t*>(d_route_bell_) + static_cast<size_t>(M) * 2560 * sizeof(uint16_t);
@@ -514,27 +514,24 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                 kernels_.launch("ple_embed_dequant", M, 1, 1, args_dq);
             }
             {
-                void* args_k[] = {&d_ple_embed_, &ple_.key_proj, &d_ple_k_, &M};
-                kernels_.launch("bf16_linear_10240_2560", 160, m_tiles16, 1, args_k);
-                void* args_v[] = {&d_ple_embed_, &ple_.value_proj, &d_ple_v_, &M};
-                kernels_.launch("bf16_linear_2560_2560", 40, m_tiles16, 1, args_v);
+                strata::kernels::launch_nvfp4_linear_auto(
+                    kernels_, "bf16_linear_10240_2560", "bf16_gemv_10240_2560", "bf16_gemv_m4_10240_2560",
+                    d_ple_embed_, ple_.key_proj, d_ple_k_, 10240, M);
+                strata::kernels::launch_nvfp4_linear_auto(
+                    kernels_, "bf16_linear_2560_2560", "bf16_gemv_2560_2560", "bf16_gemv_m4_2560_2560",
+                    d_ple_embed_, ple_.value_proj, d_ple_v_, 2560, M);
             }
-            void* ple_gvn_buf = (M <= 4) ? d_ple_verify_gvn_ : d_ple_gvn_;
             {
                 void* args[] = {&d_ple_k_, &d_ple_v_, &cur_x, &ple_.norm_key, &ple_.norm_query,
-                                &ple_.norm_conv, &d_ple_gv_, &ple_gvn_buf, &eps};
+                                &ple_.norm_conv, &d_ple_gv_, &d_ple_gvn_, &eps};
                 kernels_.launch("ple_gate", M, 1, 1, args);
             }
             {
-                void* args[] = {&cur_x, &d_ple_gv_, &ple_gvn_buf, &d_ple_conv_state_, &ple_.conv_weight, &alt_x, &M};
+                void* args[] = {&cur_x, &d_ple_gv_, &d_ple_gvn_, &d_ple_conv_state_, &ple_.conv_weight, &alt_x, &M};
                 kernels_.launch("ple_conv_add", (M * 1280 + 255) / 256, 1, 1, args);
                 std::swap(cur_x, alt_x);
             }
-            for (int32_t t = 0; t < M; ++t) {
-                void* gvn_t = static_cast<uint16_t*>(ple_gvn_buf) + static_cast<size_t>(t) * 10240;
-                void* args[] = {&d_ple_conv_state_, &gvn_t};
-                kernels_.launch_default("ple_state_update", args);
-            }
+            strata::kernels::launch_nvfp4_ple_state_update_batch(kernels_, d_ple_conv_state_, d_ple_gvn_, M);
         }
 
         {
@@ -565,59 +562,33 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
             }
         }
 
-        const bool is_small_batch = (M <= 4);
+        const bool is_verify_mode = (verify_next_toks_out != nullptr);
+        const bool is_small_batch = (is_verify_mode || M <= 16);
         if (!lw.is_qsa) {
-            void* qkv_buf = d_gdn_qkv_;
-            void* z_buf = d_gdn_z_b_;
-            void* a_buf = d_gdn_a_b_;
-            void* b_buf = d_gdn_b_b_;
-            if (is_small_batch) {
-                qkv_buf = d_gdn_verify_qkv_[l];
-                z_buf = static_cast<uint16_t*>(qkv_buf) + 4 * 10240;
-                a_buf = static_cast<uint16_t*>(qkv_buf) + 4 * 16384;
-                b_buf = static_cast<uint16_t*>(qkv_buf) + 4 * 16432;
-            }
-            {
-                void* a1[] = {&d_mixed_, &lw.gdn.in_proj_fused, &d_proj_scratch_, &M};
-                kernels_.launch("bf16_linear_16480_2560", 515, m_tiles16, 1, a1);
-                void* as[] = {&d_proj_scratch_, &qkv_buf, &z_buf, &a_buf, &b_buf};
-                kernels_.launch("gdn_proj_split", 65, M, 1, as);
-            }
-            {
-                void* csi = d_gdn_conv_in_[l];
-                void* cso = d_gdn_conv_out_[l];
-                void* st = d_gdn_state_[l];
-                void* args[] = {&qkv_buf, &z_buf, &a_buf, &b_buf, &lw.gdn.A_log, &lw.gdn.dt_bias,
-                                &lw.gdn.conv1d, &csi, &cso, &st, &lw.gdn.norm, &d_gdn_out_, &M, &eps};
-                kernels_.launch_default("gated_deltanet_fused", args);
-                std::swap(d_gdn_conv_in_[l], d_gdn_conv_out_[l]);
-            }
-            {
-                void* args[] = {&d_gdn_out_, &lw.gdn.out_proj, &d_attn_out_, &M};
-                kernels_.launch("bf16_linear_2560_6144", 40, m_tiles16, 1, args);
-            }
+            void* gdn_proj_buf = is_verify_mode ? d_gdn_verify_qkv_[l] : d_proj_scratch_;
+            strata::kernels::launch_nvfp4_linear_auto(
+                kernels_, "bf16_linear_16480_2560", "bf16_gemv_16480_2560", "bf16_gemv_m4_16480_2560",
+                d_mixed_, lw.gdn.in_proj_fused, gdn_proj_buf, 16480, M);
+            void* qkv_buf = gdn_proj_buf;
+            void* z_buf = static_cast<uint16_t*>(gdn_proj_buf) + 10240;
+            void* a_buf = static_cast<uint16_t*>(gdn_proj_buf) + 16384;
+            void* b_buf = static_cast<uint16_t*>(gdn_proj_buf) + 16432;
+            void* st_in = d_gdn_state_[l];
+            void* st_out = is_verify_mode ? d_gdn_state_ckpt_[l] : d_gdn_state_[l];
+            strata::kernels::launch_nvfp4_gated_deltanet_fused_strided(
+                kernels_, qkv_buf, z_buf, a_buf, b_buf, lw.gdn.A_log, lw.gdn.dt_bias,
+                lw.gdn.conv1d, d_gdn_conv_in_[l], d_gdn_conv_out_[l],
+                static_cast<const float*>(st_in), static_cast<float*>(st_out),
+                lw.gdn.norm, d_gdn_out_, M, 16480, eps);
+            std::swap(d_gdn_conv_in_[l], d_gdn_conv_out_[l]);
+            strata::kernels::launch_nvfp4_linear_auto(
+                kernels_, "bf16_linear_2560_6144", "bf16_gemv_2560_6144", "bf16_gemv_m4_2560_6144",
+                d_gdn_out_, lw.gdn.out_proj, d_attn_out_, 2560, M);
         } else {
             const int qsa_idx = l / 4;
-            {
-                void* a1[] = {&d_mixed_, &lw.qsa.in_proj_fused, &d_proj_scratch_, &M};
-                kernels_.launch("bf16_linear_13952_2560", 218, m_tiles16, 1, a1);
-                void* as[] = {&d_proj_scratch_, &d_qsa_qg_, &d_qsa_k_b_, &d_qsa_v_b_, &d_qsa_idx_qk_b_};
-                kernels_.launch("qsa_proj_split", 55, M, 1, as);
-            }
-            {
-                void* args[] = {&d_qsa_qg_, &d_qsa_q_};
-                kernels_.launch("qsa_q_extract", 24, M, 1, args);
-            }
-            {
-                void* cos_p = static_cast<uint8_t*>(d_rope_cos_f32_) + static_cast<size_t>(pos0) * 32 * sizeof(float);
-                void* sin_p = static_cast<uint8_t*>(d_rope_sin_f32_) + static_cast<size_t>(pos0) * 32 * sizeof(float);
-                int32_t r24 = M * 24, h24 = 24;
-                void* aq[] = {&d_qsa_q_, &lw.qsa.q_norm, &cos_p, &sin_p, &d_qsa_q_, &r24, &h24, &eps};
-                kernels_.launch("qk_norm_partial_rope", M * 3, 1, 1, aq);
-                int32_t r2 = M * 2, h2 = 2;
-                void* ak[] = {&d_qsa_k_b_, &lw.qsa.k_norm, &cos_p, &sin_p, &d_qsa_k_b_, &r2, &h2, &eps};
-                kernels_.launch("qk_norm_partial_rope", (M * 2 + 7) / 8, 1, 1, ak);
-            }
+            strata::kernels::launch_nvfp4_linear_auto(
+                kernels_, "bf16_linear_13952_2560", "bf16_gemv_13952_2560", "bf16_gemv_m4_13952_2560",
+                d_mixed_, lw.qsa.in_proj_fused, d_proj_scratch_, 13952, M);
             void* kc = d_k_cache_[qsa_idx];
             void* vc = d_v_cache_[qsa_idx];
             void* rkc = d_raw_k_cache_[qsa_idx];
@@ -625,17 +596,49 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
             int64_t kc_delta = kc_host_delta_[qsa_idx];
             int64_t vc_delta = vc_host_delta_[qsa_idx];
             int64_t bk_delta = bk_host_delta_elems_[qsa_idx];
-            {
-                void* args[] = {&d_qsa_k_b_, &d_qsa_v_b_, &d_qsa_idx_qk_b_, &kc, &vc, &rkc,
-                                &kc_delta, &vc_delta, &pos0, &vram_prefix_};
-                kernels_.launch("qsa_cache_write_nvfp4", 1, M, 1, args);
-            }
             int32_t b_start = pos0 / 4;
             int32_t b_end = (pos0 + M) / 4;
             int32_t b_cnt = b_end - b_start;
-            strata::kernels::launch_nvfp4_qsa_block_keys_from_batch(
-                rkc, d_qsa_idx_qk_b_, lw.qsa.idx_k_ln, d_rope_cos_bf16_, d_rope_sin_bf16_,
-                bkc, bk_delta, pos0, M, b_start, b_cnt, vram_blocks_, eps, nullptr);
+            if (M <= 1020) {
+                strata::kernels::launch_nvfp4_qsa_prep_and_cache_write_batch(
+                    kernels_, d_proj_scratch_, lw.qsa.q_norm, lw.qsa.k_norm, d_rope_cos_f32_, d_rope_sin_f32_,
+                    d_qsa_qg_, d_qsa_q_, d_qsa_idx_qk_b_, kc, vc, rkc, kc_delta, vc_delta,
+                    pos0, M, vram_prefix_, eps, nullptr);
+                strata::kernels::launch_nvfp4_qsa_block_keys_from_batch(
+                    kernels_, rkc, d_qsa_idx_qk_b_, lw.qsa.idx_k_ln, d_rope_cos_bf16_, d_rope_sin_bf16_,
+                    bkc, bk_delta, pos0, M, b_start, b_cnt, vram_blocks_, eps, nullptr);
+            } else {
+                {
+                    void* as[] = {&d_proj_scratch_, &d_qsa_qg_, &d_qsa_k_b_, &d_qsa_v_b_, &d_qsa_idx_qk_b_};
+                    kernels_.launch("qsa_proj_split", 55, M, 1, as);
+                }
+                {
+                    void* args[] = {&d_qsa_qg_, &d_qsa_q_};
+                    kernels_.launch("qsa_q_extract", 24, M, 1, args);
+                }
+                {
+                    void* cos_p = static_cast<uint8_t*>(d_rope_cos_f32_) + static_cast<size_t>(pos0) * 32 * sizeof(float);
+                    void* sin_p = static_cast<uint8_t*>(d_rope_sin_f32_) + static_cast<size_t>(pos0) * 32 * sizeof(float);
+                    int32_t r24 = M * 24, h24 = 24;
+                    void* aq[] = {&d_qsa_q_, &lw.qsa.q_norm, &cos_p, &sin_p, &d_qsa_q_, &r24, &h24, &eps};
+                    kernels_.launch("qk_norm_partial_rope", M * 3, 1, 1, aq);
+                    int32_t r2 = M * 2, h2 = 2;
+                    void* ak[] = {&d_qsa_k_b_, &lw.qsa.k_norm, &cos_p, &sin_p, &d_qsa_k_b_, &r2, &h2, &eps};
+                    kernels_.launch("qk_norm_partial_rope", (M * 2 + 7) / 8, 1, 1, ak);
+                }
+                strata::kernels::launch_nvfp4_qsa_block_keys_from_batch(
+                    kernels_, rkc, d_qsa_idx_qk_b_, lw.qsa.idx_k_ln, d_rope_cos_bf16_, d_rope_sin_bf16_,
+                    bkc, bk_delta, pos0, M, b_start, b_cnt, vram_blocks_, eps, nullptr);
+                {
+                    void* args[] = {&d_qsa_k_b_, &d_qsa_v_b_, &d_qsa_idx_qk_b_, &kc, &vc, &rkc,
+                                    &kc_delta, &vc_delta, &pos0, &vram_prefix_};
+                    kernels_.launch("qsa_cache_write_nvfp4", 1, M, 1, args);
+                }
+                if (M > 1024) {
+                    strata::kernels::launch_nvfp4_qsa_refresh_raw_k_tail(
+                        kernels_, rkc, d_qsa_idx_qk_b_, pos0, M, nullptr);
+                }
+            }
             if (pos0 + M > 2048) {
                 int32_t t_first = std::max(0, 2048 - pos0);
                 int32_t max_nb = (pos0 + M) / 4;
@@ -648,7 +651,7 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                     void* qk_cur = static_cast<uint16_t*>(d_qsa_idx_qk_b_) + static_cast<size_t>(t0) * 640;
                     void* sel_cur = static_cast<int32_t*>(d_qsa_sel_ids_) + static_cast<size_t>(t0) * 512;
                     strata::kernels::launch_nvfp4_qsa_score_blocks_batched(
-                        qk_cur, lw.qsa.idx_q_ln, d_rope_cos_bf16_, d_rope_sin_bf16_,
+                        kernels_, qk_cur, lw.qsa.idx_q_ln, d_rope_cos_bf16_, d_rope_sin_bf16_,
                         bkc, static_cast<float*>(d_qsa_scores_), bk_delta, pos_cur, m_cur,
                         vram_blocks_, score_stride, 16, 64, eps, nullptr);
                     void* atk[] = {&d_qsa_scores_, &sel_cur, &pos_cur, &score_stride};
@@ -660,10 +663,9 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                               &kc_delta, &vc_delta, &pos0, &M, &vram_prefix_};
                 kernels_.launch("qsa_prefill_causal_nvfp4", 24, M, 1, ap);
             }
-            {
-                void* args[] = {&d_qsa_attn_raw_, &lw.qsa.o_proj, &d_attn_out_, &M};
-                kernels_.launch("bf16_linear_2560_6144", 40, m_tiles16, 1, args);
-            }
+            strata::kernels::launch_nvfp4_linear_auto(
+                kernels_, "bf16_linear_2560_6144", "bf16_gemv_2560_6144", "bf16_gemv_m4_2560_6144",
+                d_qsa_attn_raw_, lw.qsa.o_proj, d_attn_out_, 2560, M);
         }
 
         {
@@ -685,15 +687,24 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
         }
 
         {
-            static const int32_t verify_gpu_cold_cap = []() {
+            static const int32_t verify_gpu_cold_override = []() {
                 if (const char* e = std::getenv("STRATA_VERIFY_GPU_COLD")) {
-                    return std::clamp(std::atoi(e), 0, 40);
+                    return std::clamp(std::atoi(e), -1, 40);
                 }
                 return 0;
             }();
-            const bool is_verify_batch = (verify_next_toks_out != nullptr && M <= 4 && verify_gpu_cold_cap > 0);
-            void* a_in[] = {&d_mixed_, &lw.moe.in_proj_fused, &d_proj_scratch_, &M};
-            kernels_.launch("bf16_linear_1856_2560", 29, m_tiles16, 1, a_in);
+            static const int32_t verify_decode_moe_max_m = []() {
+                if (const char* e = std::getenv("STRATA_VERIFY_DECODE_MOE")) {
+                    return std::clamp(std::atoi(e), 0, 16);
+                }
+                return 0;
+            }();
+            const int32_t cold_cap = (verify_gpu_cold_override >= 0) ? verify_gpu_cold_override : (M * 2);
+            const bool is_verify_batch = is_verify_mode && (cold_cap > 0);
+            const bool use_decode_moe = (M <= verify_decode_moe_max_m);
+            strata::kernels::launch_nvfp4_linear_auto(
+                kernels_, "bf16_linear_1856_2560", "bf16_gemv_1856_2560", "bf16_gemv_m4_1856_2560",
+                d_mixed_, lw.moe.in_proj_fused, d_proj_scratch_, 1856, M);
 
             void* r_logits = static_cast<uint16_t*>(d_proj_scratch_) + 1280;
             void* sh_sc = static_cast<uint16_t*>(d_proj_scratch_) + 1792;
@@ -704,11 +715,12 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
             int32_t pairs = M * 10;
             if (is_verify_batch) {
                 strata::kernels::launch_nvfp4_moe_cap_gpu_cold(
+                    kernels_,
                     static_cast<int32_t*>(d_cur_ids),
                     static_cast<int32_t*>(d_moe_gpu_align_ids_),
                     static_cast<const int64_t*>(lw.moe.d_ptrs),
                     static_cast<const int64_t*>(lw.moe.d_ptrs_prefill),
-                    pairs, verify_gpu_cold_cap, nullptr);
+                    pairs, cold_cap, nullptr);
             }
 
             HIP_CHECK(hipMemcpyAsync(h_route_bell_, d_route_bell_,
@@ -716,10 +728,13 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                                      hipMemcpyDeviceToHost, nullptr));
             HIP_CHECK(hipEventRecord(ev_route_, nullptr));
 
-            if (is_small_batch && !is_verify_batch) {
+            const bool use_gpu_cold_batch = !is_small_batch || is_verify_batch;
+            const bool has_gpu_experts = use_gpu_cold_batch || (lw.moe.vram_experts > 0);
+            if (has_gpu_experts && is_small_batch && !is_verify_batch && !use_decode_moe) {
                 // Filter out non-VRAM experts into d_moe_gpu_align_ids_ after ev_route_ has fired
-                // so moe_align only creates 16-row WMMA tiles for VRAM-resident experts.
+                // so moe_small_align only creates 16-row WMMA tiles for VRAM-resident experts.
                 strata::kernels::launch_nvfp4_moe_cap_gpu_cold(
+                    kernels_,
                     static_cast<int32_t*>(d_cur_ids),
                     static_cast<int32_t*>(d_moe_gpu_align_ids_),
                     static_cast<const int64_t*>(lw.moe.d_ptrs),
@@ -727,31 +742,51 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                     pairs, /*max_gpu_cold=*/0, nullptr);
             }
 
-            void* a_ex[] = {&d_proj_scratch_, &d_sh_gu_};
-            kernels_.launch("moe_sh_gu_extract", 5, M, 1, a_ex);
-            void* a_sm[] = {&d_sh_gu_, &d_sh_inter_, &M};
-            kernels_.launch("silu_mul_640", (M * 80 + 255) / 256, 1, 1, a_sm);
-            void* a_d[] = {&d_sh_inter_, &lw.moe.sh_down, &d_sh_out_, &M};
-            kernels_.launch("bf16_linear_2560_640", 40, m_tiles16, 1, a_d);
+            strata::kernels::launch_nvfp4_silu_mul_640_strided(
+                kernels_, d_proj_scratch_, d_sh_inter_, M, 1856, nullptr);
+            strata::kernels::launch_nvfp4_linear_auto(
+                kernels_, "bf16_linear_2560_640", "bf16_gemv_2560_640", "bf16_gemv_m4_2560_640",
+                d_sh_inter_, lw.moe.sh_down, d_sh_out_, 2560, M);
 
-            int32_t max_tiles = is_small_batch ? pairs : ((pairs + 15) / 16 + std::min(512, pairs));
-            void* align_ids = is_small_batch ? d_moe_gpu_align_ids_ : d_cur_ids;
-            void* a_al[] = {&align_ids, &d_moe_sorted_, &d_moe_tile_e_, &pairs, &max_tiles};
-            kernels_.launch("moe_align", 1, 1, 1, a_al);
+            if (has_gpu_experts) {
+                void* ptrs = use_gpu_cold_batch ? lw.moe.d_ptrs : lw.moe.d_ptrs_prefill;
+                void* s2 = lw.moe.d_s2;
+                if (use_decode_moe) {
+                    void* a_mgu[] = {&d_mixed_, &d_cur_ids, &ptrs, &s2, &d_moe_inter_};
+                    kernels_.launch("moe_decode_gate_up", 20, pairs, 1, a_mgu);
+                    void* a_mdn[] = {&d_moe_inter_, &d_cur_ids, &ptrs, &s2, &d_moe_y_};
+                    kernels_.launch("moe_decode_down", 20, pairs, 1, a_mdn);
+                } else {
+                    const int32_t max_moe_tiles = (kMaxBatch * 10 + 15) / 16 + 512;
+                    int32_t max_tiles = is_small_batch
+                                            ? std::min<int32_t>({pairs, max_moe_tiles,
+                                                                 use_gpu_cold_batch ? pairs : lw.moe.vram_experts})
+                                            : ((pairs + 15) / 16 + std::min(512, pairs));
+                    if (is_small_batch) {
+                        strata::kernels::launch_nvfp4_moe_small_align(
+                            kernels_,
+                            static_cast<const int32_t*>(d_moe_gpu_align_ids_),
+                            static_cast<int32_t*>(d_moe_sorted_),
+                            static_cast<int32_t*>(d_moe_tile_e_),
+                            pairs, max_tiles, nullptr);
+                    } else {
+                        void* a_al[] = {&d_cur_ids, &d_moe_sorted_, &d_moe_tile_e_, &pairs, &max_tiles};
+                        kernels_.launch("moe_align", 1, 1, 1, a_al);
+                    }
 
-            void* ptrs = is_verify_batch ? lw.moe.d_ptrs : lw.moe.d_ptrs_prefill;
-            void* s2 = lw.moe.d_s2;
-            int32_t topk10 = 10;
-            void* a_gu[] = {&d_mixed_, &d_moe_sorted_, &d_moe_tile_e_, &ptrs, &s2, &d_moe_inter_, &topk10};
-            kernels_.launch("moe_gate_up", 5, max_tiles, 1, a_gu);
-            void* a_dn[] = {&d_moe_inter_, &d_moe_sorted_, &d_moe_tile_e_, &ptrs, &s2, &d_moe_y_};
-            kernels_.launch("moe_down", 10, max_tiles, 1, a_dn);
+                    int32_t topk10 = 10;
+                    void* a_gu[] = {&d_mixed_, &d_moe_sorted_, &d_moe_tile_e_, &ptrs, &s2, &d_moe_inter_, &topk10};
+                    kernels_.launch("moe_gate_up", 5, max_tiles, 1, a_gu);
+                    void* a_dn[] = {&d_moe_inter_, &d_moe_sorted_, &d_moe_tile_e_, &ptrs, &s2, &d_moe_y_};
+                    kernels_.launch("moe_down", 10, max_tiles, 1, a_dn);
+                }
+            }
 
             if (l == 0) {
                 fetch_ple_rows_cached(tokens, prev0s, prev1s, M, h_ple_rows);
             }
 
-            (void) run_cpu_moe_layer(l, M, /*is_prefill=*/true, is_verify_batch);
+            (void) run_cpu_moe_layer(l, M, /*is_prefill=*/true, use_gpu_cold_batch);
 
             void* a_cb[] = {&d_moe_y_, &d_moe_wts_, &d_sh_out_, &sh_sc, &d_mlp_out_, &stride1856};
             kernels_.launch("moe_combine", M, 1, 1, a_cb);
@@ -767,7 +802,7 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
             void* args[] = {&cur_x, &prev_out, &prev_inj, &alt_x};
             kernels_.launch("hc_residual_add", 40, M, 1, args);
             std::swap(cur_x, alt_x);
-            strata::kernels::launch_nvfp4_mtp_ring_write(cur_x, d_mtp_r_ring_, pos0, kMtpRingMask, M, nullptr);
+            strata::kernels::launch_nvfp4_mtp_ring_write(kernels_, cur_x, d_mtp_r_ring_, pos0, kMtpRingMask, M, nullptr);
         }
         adapt_vram_experts(h_all_routed_ids_.data(), M, /*min_hits=*/2, /*max_swaps=*/12);
         return -1;
@@ -780,54 +815,70 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
         kernels_.launch("hc_premix_c0_u1", 80, M, 1, args);
         std::swap(cur_x, alt_x);
         if (mtp_.available) {
-            strata::kernels::launch_nvfp4_mtp_ring_write(cur_x, d_mtp_r_ring_, pos0, kMtpRingMask, M, nullptr);
+            strata::kernels::launch_nvfp4_mtp_ring_write(kernels_, cur_x, d_mtp_r_ring_, pos0, kMtpRingMask, M, nullptr);
         }
         void* m_args[] = {&cur_x, &final_hc_.norm, &d_hc_rstd_, &d_hc_h_, &final_hc_.up, &d_attn_out_, &M};
         kernels_.launch("hc_mix", 80, M, 1, m_args);
-        void* a_lm[] = {&d_attn_out_, &d_lm_head_, &d_logits_bf16_, &M};
-        kernels_.launch_default("bf16_gemv_m4_248320_2560", a_lm);
 
+        static constexpr size_t kVocab = 248320;
         const bool use_ver_sampling = (sp && !sp->is_greedy() && rng);
-        if (!use_ver_sampling) {
+        const size_t base_hist_len = (history && history->size() >= static_cast<size_t>(M))
+                                         ? (history->size() - static_cast<size_t>(M))
+                                         : 0;
+        if (!use_ver_sampling && M <= 16) {
+            strata::kernels::launch_nvfp4_lm_head_auto(kernels_, d_attn_out_, d_lm_head_, d_logits_bf16_, M);
             strata::kernels::launch_nvfp4_argmax_prob_margin_248320(
-                d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
+                kernels_, d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
                 static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), M, nullptr);
-            HIP_CHECK(hipMemcpy(verify_summaries_, d_argmax_summary_,
+        } else {
+            const int32_t chunk_step = 16;
+            for (int32_t t0 = 0; t0 < M; t0 += chunk_step) {
+                int32_t m_chunk = std::min<int32_t>(chunk_step, M - t0);
+                void* h_in = static_cast<uint16_t*>(d_attn_out_) + static_cast<size_t>(t0) * 2560;
+                strata::kernels::launch_nvfp4_lm_head_auto(kernels_, h_in, d_lm_head_, d_logits_bf16_, m_chunk);
+                if (!use_ver_sampling) {
+                    strata::kernels::launch_nvfp4_argmax_prob_margin_248320(
+                        kernels_, d_logits_bf16_, static_cast<int32_t*>(d_next_tok_) + t0,
+                        static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_) + t0,
+                        m_chunk, nullptr);
+                } else {
+                    uint16_t* h_bf_row = static_cast<uint16_t*>(h_cpu_upload_);
+                    for (int32_t tc = 0; tc < m_chunk; ++tc) {
+                        const int32_t t = t0 + tc;
+                        HIP_CHECK(hipMemcpy(
+                            h_bf_row,
+                            static_cast<const uint16_t*>(d_logits_bf16_) + static_cast<size_t>(tc) * kVocab,
+                            kVocab * sizeof(uint16_t), hipMemcpyDeviceToHost));
+                        int32_t d_tok = (verify_draft_toks && t + 1 < M) ? verify_draft_toks[t] : -1;
+                        float prob_t = 1.0f, margin_t = 0.0f;
+                        int32_t sampled = sample_row_from_host_bf16_logits(
+                            h_bf_row, *sp, history,
+                            base_hist_len + static_cast<size_t>(t + 1), *rng, d_tok, &prob_t, &margin_t);
+                        verify_next_toks_out[t] = sampled;
+                        verify_summaries_[static_cast<size_t>(t)].tok_id = sampled;
+                        verify_summaries_[static_cast<size_t>(t)].prob = prob_t;
+                        verify_summaries_[static_cast<size_t>(t)].margin = margin_t;
+                        if (d_tok >= 0 && sampled != d_tok) {
+                            for (int32_t rem = t + 1; rem < M; ++rem) {
+                                verify_next_toks_out[rem] = sampled;
+                                verify_summaries_[static_cast<size_t>(rem)] = verify_summaries_[static_cast<size_t>(t)];
+                            }
+                            return verify_next_toks_out[M - 1];
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!use_ver_sampling) {
+            HIP_CHECK(hipMemcpy(verify_summaries_.data(), d_argmax_summary_,
                                 static_cast<size_t>(M) * sizeof(strata::kernels::Nvfp4ArgmaxSummary),
                                 hipMemcpyDeviceToHost));
             for (int32_t t = 0; t < M; ++t) {
-                verify_next_toks_out[t] = verify_summaries_[t].tok_id;
+                verify_next_toks_out[t] = verify_summaries_[static_cast<size_t>(t)].tok_id;
             }
-            return verify_next_toks_out[M - 1];
-        } else {
-            static constexpr size_t kVocab = 248320;
-            uint16_t* h_bf_all = static_cast<uint16_t*>(h_cpu_upload_);
-            HIP_CHECK(hipMemcpy(h_bf_all, d_logits_bf16_,
-                                static_cast<size_t>(M) * kVocab * sizeof(uint16_t),
-                                hipMemcpyDeviceToHost));
-            const size_t base_hist_len = (history && history->size() >= static_cast<size_t>(M))
-                                             ? (history->size() - static_cast<size_t>(M))
-                                             : 0;
-            for (int32_t t = 0; t < M; ++t) {
-                int32_t d_tok = (verify_draft_toks && t + 1 < M) ? verify_draft_toks[t] : -1;
-                float prob_t = 1.0f, margin_t = 0.0f;
-                int32_t sampled = sample_row_from_host_bf16_logits(
-                    h_bf_all + static_cast<size_t>(t) * kVocab, *sp, history,
-                    base_hist_len + static_cast<size_t>(t + 1), *rng, d_tok, &prob_t, &margin_t);
-                verify_next_toks_out[t] = sampled;
-                verify_summaries_[t].tok_id = sampled;
-                verify_summaries_[t].prob = prob_t;
-                verify_summaries_[t].margin = margin_t;
-                if (d_tok >= 0 && sampled != d_tok) {
-                    for (int32_t rem = t + 1; rem < M; ++rem) {
-                        verify_next_toks_out[rem] = sampled;
-                        verify_summaries_[rem] = verify_summaries_[t];
-                    }
-                    break;
-                }
-            }
-            return verify_next_toks_out[M - 1];
         }
+        return verify_next_toks_out[M - 1];
     }
 
     {
@@ -845,7 +896,7 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
                         &d_hc_h_, &d_hc_h_, &d_hc_rstd_, &zero_delta, &one, &eps};
         kernels_.launch_default("hc_premix_c0_u1", args);
         if (mtp_.available) {
-            strata::kernels::launch_nvfp4_mtp_ring_write(alt_x, d_mtp_r_ring_, pos0, kMtpRingMask, M, nullptr);
+            strata::kernels::launch_nvfp4_mtp_ring_write(kernels_, alt_x, d_mtp_r_ring_, pos0, kMtpRingMask, M, nullptr);
         }
         void* m_args[] = {&last_alt, &final_hc_.norm, &d_hc_rstd_, &d_hc_h_, &final_hc_.up, &d_final_hidden_, &one};
         kernels_.launch_default("hc_mix_decode", m_args);
@@ -857,7 +908,7 @@ int32_t Qwen4ExpGfx1201Engine::step_prefill_batch(const int32_t* tokens, const i
         kernels_.launch_default("bf16_gemv_248320_2560", a_lm);
         if (!use_sampling) {
             strata::kernels::launch_nvfp4_argmax_prob_margin_248320(
-                d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
+                kernels_, d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
                 static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), 1, nullptr);
         }
     }
@@ -970,9 +1021,10 @@ int32_t Qwen4ExpGfx1201Engine::sample_row_from_host_bf16_logits(const uint16_t* 
                                                                 float* margin_out) {
     static constexpr int32_t kVocab = 248320;
 
-    std::vector<float> logits(kVocab);
+    thread_local std::vector<float> logits(kVocab);
+    float* __restrict logits_ptr = logits.data();
     for (int32_t i = 0; i < kVocab; ++i) {
-        logits[i] = bf16_bits_to_f32(h_bf[i]);
+        logits_ptr[i] = bf16_bits_to_f32(h_bf[i]);
     }
 
     if (history && !history->empty() && hist_len > 0 &&
@@ -987,13 +1039,13 @@ int32_t Qwen4ExpGfx1201Engine::sample_row_from_host_bf16_logits(const uint16_t* 
         for (const auto& kv : counts) {
             int32_t tid = kv.first;
             int32_t cnt = kv.second;
-            float v = logits[tid];
+            float v = logits_ptr[tid];
             if (sp.repeat_penalty != 1.0f && sp.repeat_penalty > 0.0f) {
                 v = (v < 0.0f) ? (v * sp.repeat_penalty) : (v / sp.repeat_penalty);
             }
             v -= sp.presence_penalty;
             v -= sp.frequency_penalty * static_cast<float>(cnt);
-            logits[tid] = v;
+            logits_ptr[tid] = v;
         }
     }
 
@@ -1006,7 +1058,7 @@ int32_t Qwen4ExpGfx1201Engine::sample_row_from_host_bf16_logits(const uint16_t* 
     float max2_l = -1e30f;
     int32_t best_id = 0;
     for (int32_t i = 0; i < kVocab; ++i) {
-        float v = logits[i];
+        float v = logits_ptr[i];
         if (v > max_l) {
             max2_l = max_l;
             max_l = v;
@@ -1025,8 +1077,8 @@ int32_t Qwen4ExpGfx1201Engine::sample_row_from_host_bf16_logits(const uint16_t* 
     std::vector<Cand> cands;
     cands.reserve(2048);
     for (int32_t i = 0; i < kVocab; ++i) {
-        if (logits[i] >= cutoff) {
-            cands.push_back(Cand{logits[i], i});
+        if (logits_ptr[i] >= cutoff) {
+            cands.push_back(Cand{logits_ptr[i], i});
         }
     }
     if (static_cast<int32_t>(cands.size()) < K && sp.top_k > 0) {
@@ -1139,7 +1191,7 @@ int32_t Qwen4ExpGfx1201Engine::sample_from_device_logits(const Nvfp4SamplingPara
 }
 
 void Qwen4ExpGfx1201Engine::save_recurrent_ckpt() {
-    HIP_CHECK(hipMemcpyAsync(d_recurrent_ckpt_, d_recurrent_arena_, recurrent_ckpt_bytes_,
+    HIP_CHECK(hipMemcpyAsync(d_recurrent_ckpt_, d_recurrent_arena_, conv_ckpt_bytes_,
                              hipMemcpyDeviceToDevice, nullptr));
     for (int l = 0; l < 48; ++l) {
         ckpt_gdn_conv_in_[l] = d_gdn_conv_in_[l];
@@ -1148,48 +1200,44 @@ void Qwen4ExpGfx1201Engine::save_recurrent_ckpt() {
 }
 
 void Qwen4ExpGfx1201Engine::restore_recurrent_ckpt() {
-    // Zero-copy ping-pong recurrent state restore:
-    // Swap d_recurrent_arena_ and d_recurrent_ckpt_ in-place and rebase all GDN/PLE recurrent pointers
-    // without copying 112.4 MiB across VRAM on rollback.
-    const intptr_t delta = static_cast<uint8_t*>(d_recurrent_ckpt_) - static_cast<uint8_t*>(d_recurrent_arena_);
-    std::swap(d_recurrent_arena_, d_recurrent_ckpt_);
-    d_ple_conv_state_ = static_cast<uint8_t*>(d_ple_conv_state_) + delta;
+    // Copy only the 4.39 MiB PLE + GDN conv1d state back; GDN 108 MiB state is preserved out-of-place.
+    HIP_CHECK(hipMemcpyAsync(d_recurrent_arena_, d_recurrent_ckpt_, conv_ckpt_bytes_,
+                             hipMemcpyDeviceToDevice, nullptr));
     for (int l = 0; l < 48; ++l) {
         if (l % 4 != 3) {
-            d_gdn_conv_in_[l] = static_cast<uint8_t*>(ckpt_gdn_conv_in_[l]) + delta;
-            d_gdn_conv_out_[l] = static_cast<uint8_t*>(ckpt_gdn_conv_out_[l]) + delta;
-            d_gdn_state_[l] = static_cast<uint8_t*>(d_gdn_state_[l]) + delta;
-            init_gdn_conv_in_[l] = static_cast<uint8_t*>(init_gdn_conv_in_[l]) + delta;
-            init_gdn_conv_out_[l] = static_cast<uint8_t*>(init_gdn_conv_out_[l]) + delta;
+            d_gdn_conv_in_[l] = ckpt_gdn_conv_in_[l];
+            d_gdn_conv_out_[l] = ckpt_gdn_conv_out_[l];
         }
     }
 }
 
 void Qwen4ExpGfx1201Engine::finish_verify_step(int32_t M, int32_t n_adv) {
     int32_t acc_idx = std::clamp(n_adv - 1, 0, std::max(0, M - 1));
-    last_target_prob_ = verify_summaries_[acc_idx].prob;
-    last_target_margin_ = verify_summaries_[acc_idx].margin;
-    if (n_adv < M) {
-        restore_recurrent_ckpt();
-        for (int32_t t = 0; t < n_adv; ++t) {
-            void* gvn_t = static_cast<uint16_t*>(d_ple_verify_gvn_) + static_cast<size_t>(t) * 10240;
-            void* args[] = {&d_ple_conv_state_, &gvn_t};
-            kernels_.launch_default("ple_state_update", args);
+    last_target_prob_ = verify_summaries_[static_cast<size_t>(acc_idx)].prob;
+    last_target_margin_ = verify_summaries_[static_cast<size_t>(acc_idx)].margin;
+    if (n_adv == M) {
+        for (int l = 0; l < 48; ++l) {
+            if (!layers_[l].is_qsa) {
+                std::swap(d_gdn_state_[l], d_gdn_state_ckpt_[l]);
+            }
         }
+    } else if (n_adv < M) {
+        restore_recurrent_ckpt();
+        strata::kernels::launch_nvfp4_ple_state_update_batch(kernels_, d_ple_conv_state_, d_ple_gvn_, n_adv);
         float eps = 1e-6f;
         for (int l = 0; l < 48; ++l) {
             Nvfp4LayerWeights& lw = layers_[l];
             if (!lw.is_qsa) {
                 void* v_qkv = d_gdn_verify_qkv_[l];
-                void* v_z = static_cast<uint16_t*>(v_qkv) + 4 * 10240;
-                void* v_a = static_cast<uint16_t*>(v_qkv) + 4 * 16384;
-                void* v_b = static_cast<uint16_t*>(v_qkv) + 4 * 16432;
-                void* csi = d_gdn_conv_in_[l];
-                void* cso = d_gdn_conv_out_[l];
-                void* st = d_gdn_state_[l];
-                void* args[] = {&v_qkv, &v_z, &v_a, &v_b, &lw.gdn.A_log, &lw.gdn.dt_bias,
-                                &lw.gdn.conv1d, &csi, &cso, &st, &lw.gdn.norm, &d_gdn_out_, &n_adv, &eps};
-                kernels_.launch_default("gated_deltanet_fused", args);
+                void* v_z = static_cast<uint16_t*>(v_qkv) + 10240;
+                void* v_a = static_cast<uint16_t*>(v_qkv) + 16384;
+                void* v_b = static_cast<uint16_t*>(v_qkv) + 16432;
+                strata::kernels::launch_nvfp4_gated_deltanet_fused_strided(
+                    kernels_, v_qkv, v_z, v_a, v_b, lw.gdn.A_log, lw.gdn.dt_bias,
+                    lw.gdn.conv1d, d_gdn_conv_in_[l], d_gdn_conv_out_[l],
+                    static_cast<const float*>(d_gdn_state_[l]),
+                    static_cast<float*>(d_gdn_state_[l]),
+                    lw.gdn.norm, d_gdn_out_, n_adv, 16480, eps);
                 std::swap(d_gdn_conv_in_[l], d_gdn_conv_out_[l]);
             }
         }
@@ -1203,20 +1251,42 @@ void Qwen4ExpGfx1201Engine::finish_verify_step(int32_t M, int32_t n_adv) {
 }
 
 void Qwen4ExpGfx1201Engine::reset_session() {
-    HIP_CHECK(hipMemsetAsync(d_recurrent_arena_, 0, recurrent_ckpt_bytes_, nullptr));
+    HIP_CHECK(hipMemsetAsync(d_recurrent_arena_, 0, conv_ckpt_bytes_, nullptr));
+    const size_t gdn_state_bytes = 48 * 128 * 128 * sizeof(float);
+    for (int l = 0; l < 48; ++l) {
+        if (l % 4 != 3 && d_gdn_state_[l]) {
+            HIP_CHECK(hipMemsetAsync(d_gdn_state_[l], 0, gdn_state_bytes, nullptr));
+        }
+    }
     if (d_raw_k_arena_ && raw_k_arena_bytes_ > 0) {
         HIP_CHECK(hipMemsetAsync(d_raw_k_arena_, 0, raw_k_arena_bytes_, nullptr));
     }
     for (int l = 0; l < 48; ++l) {
         d_gdn_conv_in_[l] = init_gdn_conv_in_[l];
         d_gdn_conv_out_[l] = init_gdn_conv_out_[l];
+        Nvfp4MoeWeights& mw = layers_[l].moe;
+        for (int e = 0; e < 512; ++e) {
+            mw.hit_count[e] = mw.in_vram[e] ? 4 : 0;
+        }
+        for (int s = 0; s < 32; ++s) {
+            mw.slot_last_used[s] = 0;
+        }
     }
+    step_counter_ = 0;
     mtp_kv_pos_ = 0;
 }
 
 void Qwen4ExpGfx1201Engine::save_turn_ckpt(const std::vector<int32_t>& ids, int32_t next_tok) {
     if (!h_turn_ckpt_) return;
-    HIP_CHECK(hipMemcpy(h_turn_ckpt_, d_recurrent_arena_, recurrent_ckpt_bytes_, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(h_turn_ckpt_, d_recurrent_arena_, conv_ckpt_bytes_, hipMemcpyDeviceToHost));
+    const size_t gdn_state_bytes = 48 * 128 * 128 * sizeof(float);
+    uint8_t* h_gdn_dst = static_cast<uint8_t*>(h_turn_ckpt_) + conv_ckpt_bytes_;
+    for (int l = 0; l < 48; ++l) {
+        if (l % 4 != 3) {
+            HIP_CHECK(hipMemcpy(h_gdn_dst, d_gdn_state_[l], gdn_state_bytes, hipMemcpyDeviceToHost));
+            h_gdn_dst += gdn_state_bytes;
+        }
+    }
     if (d_raw_k_arena_ && raw_k_arena_bytes_ > 0) {
         HIP_CHECK(hipMemcpy(static_cast<uint8_t*>(h_turn_ckpt_) + recurrent_ckpt_bytes_,
                             d_raw_k_arena_, raw_k_arena_bytes_, hipMemcpyDeviceToHost));
@@ -1231,7 +1301,15 @@ void Qwen4ExpGfx1201Engine::save_turn_ckpt(const std::vector<int32_t>& ids, int3
 
 void Qwen4ExpGfx1201Engine::restore_turn_ckpt(std::vector<int32_t>& history_out, int32_t& next_tok_out) {
     if (!h_turn_ckpt_) return;
-    HIP_CHECK(hipMemcpy(d_recurrent_arena_, h_turn_ckpt_, recurrent_ckpt_bytes_, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_recurrent_arena_, h_turn_ckpt_, conv_ckpt_bytes_, hipMemcpyHostToDevice));
+    const size_t gdn_state_bytes = 48 * 128 * 128 * sizeof(float);
+    const uint8_t* h_gdn_src = static_cast<const uint8_t*>(h_turn_ckpt_) + conv_ckpt_bytes_;
+    for (int l = 0; l < 48; ++l) {
+        if (l % 4 != 3) {
+            HIP_CHECK(hipMemcpy(d_gdn_state_[l], h_gdn_src, gdn_state_bytes, hipMemcpyHostToDevice));
+            h_gdn_src += gdn_state_bytes;
+        }
+    }
     if (d_raw_k_arena_ && raw_k_arena_bytes_ > 0) {
         HIP_CHECK(hipMemcpy(d_raw_k_arena_,
                             static_cast<const uint8_t*>(h_turn_ckpt_) + recurrent_ckpt_bytes_,
@@ -1287,7 +1365,7 @@ int32_t Qwen4ExpGfx1201Engine::run_mtp_cpu_moe_decode() {
         jb.nt = 1;
         jb.x_f32 = mtp_act_f32_;
         jb.d_x[0] = mtp_act_f32_;
-        jb.y_f32 = (n_miss == 1) ? h_accum_f32 : (h_accum_f32 + static_cast<size_t>(i + 1) * 2560);
+        jb.y_f32 = jb.y_buf_f32;
     }
     cpu_pool_.run_mtp_decode_batch(cpu_jobs_.data(), n_miss, h_accum_f32);
     HIP_CHECK(hipMemcpyAsync(d_cpu_upload_, h_accum_f32, 2560 * sizeof(float), hipMemcpyHostToDevice, nullptr));
@@ -1306,27 +1384,27 @@ void Qwen4ExpGfx1201Engine::run_mtp_kv_batch(const int32_t* next_toks, int32_t c
                              hipMemcpyHostToDevice, nullptr));
 
     float eps = 1e-6f;
-    const int32_t m_tiles16 = (M + 15) / 16;
     const int32_t m_tiles64 = (M + 63) / 64;
     const bool use_wmma_hc = (M >= 16);
 
     strata::kernels::launch_nvfp4_mtp_emb_rms_norm(
-        static_cast<const int32_t*>(d_batch_toks), d_embed_tokens_,
+        kernels_, static_cast<const int32_t*>(d_batch_toks), d_embed_tokens_,
         mtp_.pre_fc_norm_embedding, d_mtp_emb_norm_, M, eps, nullptr);
     strata::kernels::launch_nvfp4_mtp_hidden_rms_norm(
-        d_mtp_r_ring_, cell0, kMtpRingMask, mtp_.pre_fc_norm_hidden,
+        kernels_, d_mtp_r_ring_, cell0, kMtpRingMask, mtp_.pre_fc_norm_hidden,
         d_mtp_h_norm_, M, eps, mtp_hnorm_per_stream_, nullptr);
 
     {
-        void* a_fe[] = {&d_mtp_emb_norm_, &mtp_.fc_embedding, &d_mtp_e2_, &M};
-        kernels_.launch("bf16_linear_2560_2560", 40, m_tiles16, 1, a_fe);
+        strata::kernels::launch_nvfp4_linear_auto(
+            kernels_, "bf16_linear_2560_2560", "bf16_gemv_2560_2560", "bf16_gemv_m4_2560_2560",
+            d_mtp_emb_norm_, mtp_.fc_embedding, d_mtp_e2_, 2560, M);
         int32_t M4 = 4 * M;
-        int32_t m4_tiles16 = (M4 + 15) / 16;
-        void* a_fh[] = {&d_mtp_h_norm_, &mtp_.fc_hidden, &d_mtp_h2_, &M4};
-        kernels_.launch("bf16_linear_2560_2560", 40, m4_tiles16, 1, a_fh);
+        strata::kernels::launch_nvfp4_linear_auto(
+            kernels_, "bf16_linear_2560_2560", "bf16_gemv_2560_2560", "bf16_gemv_m4_2560_2560",
+            d_mtp_h_norm_, mtp_.fc_hidden, d_mtp_h2_, 2560, M4);
     }
     strata::kernels::launch_nvfp4_mtp_stream_broadcast_add(
-        d_mtp_h2_, d_mtp_e2_, d_x_stream_a_, M, nullptr);
+        kernels_, d_mtp_h2_, d_mtp_e2_, d_x_stream_a_, M, nullptr);
 
     void* cur_x = d_x_stream_a_;
     {
@@ -1348,7 +1426,7 @@ void Qwen4ExpGfx1201Engine::run_mtp_kv_batch(const int32_t* next_toks, int32_t c
 
     const void* w_kv_idx = static_cast<const uint16_t*>(mtp_.qsa.in_proj_fused) + 12288ULL * 2560;
     strata::kernels::launch_nvfp4_mtp_kv_idx_proj(
-        d_mixed_, w_kv_idx, d_qsa_k_b_, d_qsa_v_b_, d_qsa_idx_qk_b_, M, nullptr);
+        kernels_, d_mixed_, w_kv_idx, d_qsa_k_b_, d_qsa_v_b_, d_qsa_idx_qk_b_, M, nullptr);
 
     {
         void* cos_p = static_cast<uint8_t*>(d_rope_cos_f32_) + static_cast<size_t>(cell0) * 32 * sizeof(float);
@@ -1361,21 +1439,13 @@ void Qwen4ExpGfx1201Engine::run_mtp_kv_batch(const int32_t* next_toks, int32_t c
     void* kc = d_k_cache_[kMtpQsaIdx];
     void* vc = d_v_cache_[kMtpQsaIdx];
     void* rkc = d_raw_k_cache_[kMtpQsaIdx];
-    void* bkc = d_block_k_cache_[kMtpQsaIdx];
     int64_t kc_delta = kc_host_delta_[kMtpQsaIdx];
     int64_t vc_delta = vc_host_delta_[kMtpQsaIdx];
-    int64_t bk_delta = bk_host_delta_elems_[kMtpQsaIdx];
     {
         void* args[] = {&d_qsa_k_b_, &d_qsa_v_b_, &d_qsa_idx_qk_b_, &kc, &vc, &rkc,
                         &kc_delta, &vc_delta, &cell0, &vram_prefix_};
         kernels_.launch("qsa_cache_write_nvfp4", 1, M, 1, args);
     }
-    int32_t b_start = cell0 / 4;
-    int32_t b_end = (cell0 + M) / 4;
-    int32_t b_cnt = b_end - b_start;
-    strata::kernels::launch_nvfp4_qsa_block_keys_from_batch(
-        rkc, d_qsa_idx_qk_b_, mtp_.qsa.idx_k_ln, d_rope_cos_bf16_, d_rope_sin_bf16_,
-        bkc, bk_delta, cell0, M, b_start, b_cnt, vram_blocks_, eps, nullptr);
 }
 
 int32_t Qwen4ExpGfx1201Engine::run_mtp_step_token(int32_t next_tok, int32_t cell, bool from_ring,
@@ -1398,25 +1468,25 @@ int32_t Qwen4ExpGfx1201Engine::run_mtp_step_token(int32_t next_tok, int32_t cell
     void* d_cur_wts = static_cast<uint8_t*>(d_cur_ids) + 10 * sizeof(int32_t);
 
     strata::kernels::launch_nvfp4_mtp_emb_rms_norm(
-        static_cast<const int32_t*>(d_tok_id_), d_embed_tokens_,
+        kernels_, static_cast<const int32_t*>(d_tok_id_), d_embed_tokens_,
         mtp_.pre_fc_norm_embedding, d_mtp_emb_norm_, 1, eps, nullptr);
     if (from_ring) {
         strata::kernels::launch_nvfp4_mtp_hidden_rms_norm(
-            d_mtp_r_ring_, cell, kMtpRingMask, mtp_.pre_fc_norm_hidden,
+            kernels_, d_mtp_r_ring_, cell, kMtpRingMask, mtp_.pre_fc_norm_hidden,
             d_mtp_h_norm_, 1, eps, mtp_hnorm_per_stream_, nullptr);
     } else {
         strata::kernels::launch_nvfp4_mtp_hidden_rms_norm(
-            d_mtp_r_state_, 0, 0, mtp_.pre_fc_norm_hidden,
+            kernels_, d_mtp_r_state_, 0, 0, mtp_.pre_fc_norm_hidden,
             d_mtp_h_norm_, 1, eps, mtp_hnorm_per_stream_, nullptr);
     }
     {
-        void* a_fe[] = {&d_mtp_emb_norm_, &mtp_.fc_embedding, &d_mtp_e2_, &one};
-        kernels_.launch("bf16_linear_2560_2560", 40, 1, 1, a_fe);
+        void* a_fe[] = {&d_mtp_emb_norm_, &mtp_.fc_embedding, &d_mtp_e2_};
+        kernels_.launch_default("bf16_gemv_2560_2560", a_fe);
         void* a_fh[] = {&d_mtp_h_norm_, &mtp_.fc_hidden, &d_mtp_h2_, &four};
-        kernels_.launch("bf16_linear_2560_2560", 40, 1, 1, a_fh);
+        kernels_.launch_default("bf16_gemv_m4_2560_2560", a_fh);
     }
     strata::kernels::launch_nvfp4_mtp_stream_broadcast_add(
-        d_mtp_h2_, d_mtp_e2_, d_x_stream_a_, 1, nullptr);
+        kernels_, d_mtp_h2_, d_mtp_e2_, d_x_stream_a_, 1, nullptr);
 
     void* cur_x = d_x_stream_a_;
     void* alt_x = d_x_stream_b_;
@@ -1436,28 +1506,19 @@ int32_t Qwen4ExpGfx1201Engine::run_mtp_step_token(int32_t next_tok, int32_t cell
     void* kc = d_k_cache_[kMtpQsaIdx];
     void* vc = d_v_cache_[kMtpQsaIdx];
     void* rkc = d_raw_k_cache_[kMtpQsaIdx];
-    void* bkc = d_block_k_cache_[kMtpQsaIdx];
     int64_t kc_delta = kc_host_delta_[kMtpQsaIdx];
     int64_t vc_delta = vc_host_delta_[kMtpQsaIdx];
-    int64_t bk_delta = bk_host_delta_elems_[kMtpQsaIdx];
     {
         void* args[] = {&d_qsa_qg_, &mtp_.qsa.q_norm, &mtp_.qsa.k_norm, &d_rope_cos_f32_, &d_rope_sin_f32_,
                         &d_qsa_q_, &kc, &vc, &rkc, &kc_delta, &vc_delta, &cell, &vram_prefix_, &eps};
         kernels_.launch_default("qsa_prep_and_cache_write_nvfp4", args);
-    }
-    if ((cell + 1) % 4 == 0) {
-        int32_t b_start = cell / 4;
-        int32_t count = 1;
-        void* args[] = {&rkc, &mtp_.qsa.idx_k_ln, &d_rope_cos_bf16_, &d_rope_sin_bf16_, &bkc,
-                        &bk_delta, &b_start, &count, &vram_blocks_, &eps};
-        kernels_.launch("qsa_block_keys_tiered", 1, 1, 1, args);
     }
     int32_t Lk = cell + 1;
     int32_t chunk = 256;
     if (Lk <= 256) {
         void* af[] = {&d_qsa_q_, &kc, &vc, &d_qsa_qg_, &d_qsa_attn_raw_, &d_seq_k_i32_};
         kernels_.launch_default("attn_decode_fused_nvfp4", af);
-    } else if (Lk <= 2048) {
+    } else if (Lk <= 1088) {
         int32_t splits = (Lk + chunk - 1) / chunk;
         void* ap[] = {&d_qsa_q_, &kc, &vc, &d_zero_mask_, &d_attn_pm_, &d_attn_pl_, &d_attn_pa_,
                       &d_seq_k_i32_, &chunk, &splits};
@@ -1465,21 +1526,9 @@ int32_t Qwen4ExpGfx1201Engine::run_mtp_step_token(int32_t next_tok, int32_t cell
         void* ac[] = {&d_attn_pm_, &d_attn_pl_, &d_attn_pa_, &d_qsa_qg_, &d_qsa_attn_raw_, &splits};
         kernels_.launch("attn_decode_combine", 24, 1, 1, ac);
     } else {
-        int32_t nb = (cell + 1) / 4;
-        int32_t score_grid = std::max(1, (nb + 255) / 256);
-        void* asc[] = {&d_qsa_idx_qk_, &mtp_.qsa.idx_q_ln, &d_rope_cos_bf16_, &d_rope_sin_bf16_,
-                       &bkc, &d_qsa_scores_, &bk_delta, &cell, &vram_blocks_, &max_blocks_, &eps};
-        kernels_.launch("qsa_score_blocks_tiered", score_grid, 1, 1, asc);
-        strata::kernels::launch_nvfp4_qsa_pin_sink_and_window(
-            static_cast<float*>(d_qsa_scores_), cell, 1, max_blocks_, 16, 64, nullptr);
-        void* atk[] = {&d_qsa_scores_, &d_qsa_sel_ids_, &cell, &max_blocks_};
-        kernels_.launch("qsa_topk_blocks", 1, 1, 1, atk);
-        int32_t splits = 9;
-        void* ap[] = {&d_qsa_q_, &kc, &vc, &d_qsa_sel_ids_, &d_pos_i32_, &d_attn_pm_, &d_attn_pl_,
-                      &d_attn_pa_, &kc_delta, &vc_delta, &vram_prefix_, &chunk, &splits};
-        kernels_.launch("qsa_sparse_decode_partial_nvfp4", splits * 24, 1, 1, ap);
-        void* ac[] = {&d_attn_pm_, &d_attn_pl_, &d_attn_pa_, &d_qsa_qg_, &d_qsa_attn_raw_, &splits};
-        kernels_.launch("attn_decode_combine", 24, 1, 1, ac);
+        strata::kernels::launch_nvfp4_qsa_swa_sink_decode_fused(
+            kernels_, d_qsa_q_, kc, vc, d_qsa_qg_, d_qsa_attn_raw_,
+            kc_delta, vc_delta, cell, vram_prefix_, /*sink_tokens=*/64, /*window_tokens=*/1024, nullptr);
     }
     {
         void* args[] = {&d_qsa_attn_raw_, &mtp_.qsa.o_proj, &d_attn_out_};
@@ -1507,7 +1556,7 @@ int32_t Qwen4ExpGfx1201Engine::run_mtp_step_token(int32_t next_tok, int32_t cell
 
         if (mtp_topk_ > 0 && mtp_topk_ < 10) {
             strata::kernels::launch_nvfp4_mtp_topk_truncate(
-                static_cast<int32_t*>(d_cur_ids), static_cast<float*>(d_cur_wts), mtp_topk_, nullptr);
+                kernels_, static_cast<int32_t*>(d_cur_ids), static_cast<float*>(d_cur_wts), mtp_topk_, nullptr);
         }
 
         HIP_CHECK(hipMemcpyAsync(h_route_bell_, d_route_bell_,
@@ -1518,12 +1567,13 @@ int32_t Qwen4ExpGfx1201Engine::run_mtp_step_token(int32_t next_tok, int32_t cell
         void* a_d[] = {&d_sh_inter_, &mtp_.moe.sh_down, &d_sh_out_};
         kernels_.launch_default("bf16_gemv_2560_640", a_d);
 
+        const int32_t mtp_gpu_slots = (mtp_topk_ > 0) ? std::min<int32_t>(3, mtp_topk_) : 3;
         strata::kernels::launch_nvfp4_mtp_moe_decode_gate_up(
-            d_mixed_, static_cast<const int32_t*>(d_cur_ids),
-            static_cast<const int64_t*>(ptrs), d_moe_inter_, nullptr);
+            kernels_, d_mixed_, static_cast<const int32_t*>(d_cur_ids),
+            static_cast<const int64_t*>(ptrs), d_moe_inter_, mtp_gpu_slots, nullptr);
         strata::kernels::launch_nvfp4_mtp_moe_decode_down(
-            d_moe_inter_, static_cast<const int32_t*>(d_cur_ids),
-            static_cast<const int64_t*>(ptrs), d_moe_y_, nullptr);
+            kernels_, d_moe_inter_, static_cast<const int32_t*>(d_cur_ids),
+            static_cast<const int64_t*>(ptrs), d_moe_y_, mtp_gpu_slots, nullptr);
 
         int32_t has_cpu = run_mtp_cpu_moe_decode();
 
@@ -1545,17 +1595,17 @@ int32_t Qwen4ExpGfx1201Engine::run_mtp_step_token(int32_t next_tok, int32_t cell
 
     if (d_mtp_dvocab_ != nullptr && n_mtp_dvocab_ > 0) {
         strata::kernels::launch_nvfp4_mtp_dvocab_gemv(
-            d_final_hidden_, d_lm_head_, static_cast<const int32_t*>(d_mtp_dvocab_),
+            kernels_, d_final_hidden_, d_lm_head_, static_cast<const int32_t*>(d_mtp_dvocab_),
             d_logits_bf16_, n_mtp_dvocab_, nullptr);
         strata::kernels::launch_nvfp4_argmax_prob_margin_dvocab(
-            d_logits_bf16_, static_cast<const int32_t*>(d_mtp_dvocab_), n_mtp_dvocab_,
+            kernels_, d_logits_bf16_, static_cast<const int32_t*>(d_mtp_dvocab_), n_mtp_dvocab_,
             static_cast<int32_t*>(d_next_tok_),
             static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), nullptr);
     } else {
         void* a_lm[] = {&d_final_hidden_, &d_lm_head_, &d_logits_bf16_};
         kernels_.launch_default("bf16_gemv_248320_2560", a_lm);
         strata::kernels::launch_nvfp4_argmax_prob_margin_248320(
-            d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
+            kernels_, d_logits_bf16_, static_cast<int32_t*>(d_next_tok_),
             static_cast<strata::kernels::Nvfp4ArgmaxSummary*>(d_argmax_summary_), 1, nullptr);
     }
 
@@ -1610,6 +1660,13 @@ void Qwen4ExpGfx1201Engine::draft_mtp(int32_t next_tok, const std::vector<int32_
     if (probs_out) probs_out->clear();
     if (!mtp_.available || max_drafts <= 0 || history.empty()) return;
 
+    // Target certainty & margin pre-gating (DS-2):
+    // Skip neural MTP step 0 when the target model's last token had very high entropy
+    // (low top-1 probability and narrow top-2 logit margin).
+    if (last_target_prob_ < 0.22f && last_target_margin_ < 0.85f) {
+        return;
+    }
+
     const int32_t cur_pos = static_cast<int32_t>(history.size());
     if (mtp_kv_pos_ < cur_pos - 1) {
         mtp_catchup_kv(history, cur_pos - 1);
@@ -1637,6 +1694,7 @@ void Qwen4ExpGfx1201Engine::draft_mtp(int32_t next_tok, const std::vector<int32_
     int32_t cur_tok = next_tok;
     int32_t p0 = (history.size() >= 2) ? history[history.size() - 2] : strata::kernels::TOKEN_NULL;
     int32_t p1 = history.back();
+    double cum_surv = 1.0;
     for (int32_t j = 0; j < max_drafts; ++j) {
         float prob = 0.0f;
         float margin = 0.0f;
@@ -1649,11 +1707,10 @@ void Qwen4ExpGfx1201Engine::draft_mtp(int32_t next_tok, const std::vector<int32_
         if (d_tok < 0 || d_tok == 248044 || d_tok == 248046) {
             break;
         }
-        // For j == 0, skip batch verification if the MTP draft has very low confidence (< 0.18).
-        // For j > 0, we already executed run_mtp_step_token, and verifying M+1 vs M costs the same 16-row tile,
-        // so include d_tok unless prob is extremely low (< 0.15), and use min_prob to gate launching step j+1.
-        const float keep_floor = (j == 0) ? std::min(min_prob, 0.18f) : 0.15f;
-        if (prob < keep_floor) {
+        // Calibrated step survival score combining top-1 softmax probability and top-2 logit margin
+        const float step_conf = std::clamp(prob + 0.04f * std::min(margin, 3.0f), 0.0f, 0.99f);
+        const float keep_floor = (j == 0) ? std::min(min_prob, 0.22f) : 0.18f;
+        if (step_conf < keep_floor) {
             break;
         }
         draft_out.push_back(d_tok);
@@ -1661,8 +1718,11 @@ void Qwen4ExpGfx1201Engine::draft_mtp(int32_t next_tok, const std::vector<int32_
         p0 = p1;
         p1 = cur_tok;
         cur_tok = d_tok;
-        const float step_chain_thresh = (j == 0) ? min_prob : std::max(min_prob, 0.70f);
-        if (prob < step_chain_thresh) {
+        cum_surv *= static_cast<double>(step_conf);
+        // Speculative throughput scheduler (STS) stopping rule for launching step j+1:
+        // Require cumulative prefix survival >= 0.48 and current step confidence >= step_chain_thresh.
+        const float step_chain_thresh = (j == 0) ? std::max(min_prob, 0.58f) : std::max(min_prob, 0.72f);
+        if (step_conf < step_chain_thresh || cum_surv < 0.48) {
             break;
         }
     }
@@ -1687,6 +1747,7 @@ int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefi
     std::memset(tok_needed, 0, static_cast<size_t>(M));
     int32_t n_miss = 0;
     const bool use_gpu_cold = !is_prefill || use_gpu_cold_cap;
+    int32_t exp_cnt[512]{};
     for (int32_t p = 0; p < pairs; ++p) {
         int32_t raw_id = h_ids[p];
         int32_t e = (raw_id >= 0) ? (raw_id & 0xFFFF) : -1;
@@ -1701,6 +1762,7 @@ int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefi
         bool on_cpu = !mw.in_vram[e] && (!use_gpu_cold || forced_cpu || !mw.in_gpu_cold[e]);
         if (on_cpu) {
             misses[n_miss++] = MoeMissItem{e, p};
+            exp_cnt[e]++;
             tok_needed[p / 10] = 1;
         }
     }
@@ -1724,7 +1786,7 @@ int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefi
             jb.q_x[0] = act_q_;
             jb.d_x[0] = act_d_;
             jb.neg_bias_x[0] = act_nb_;
-            jb.y_f32 = (n_miss == 1) ? h_accum_f32 : (h_accum_f32 + static_cast<size_t>(i + 1) * 2560);
+            jb.y_f32 = jb.y_buf_f32;
         }
         cpu_pool_.run_decode_batch(cpu_jobs_.data(), n_miss, h_accum_f32);
         HIP_CHECK(hipMemcpyAsync(d_cpu_upload_, h_accum_f32, 2560 * sizeof(float), hipMemcpyHostToDevice, nullptr));
@@ -1734,21 +1796,23 @@ int32_t Qwen4ExpGfx1201Engine::run_cpu_moe_layer(int l, int32_t M, bool is_prefi
     }
 
     if (n_miss > 1) {
-        std::sort(misses, misses + n_miss, [](const MoeMissItem& a, const MoeMissItem& b) {
-            return (a.e != b.e) ? (a.e < b.e) : (a.pair < b.pair);
-        });
-    }
-
-    for (int32_t t = 0; t < M; ++t) {
-        if (tok_needed[t]) {
-            quantize_act_bf16_2560(h_mixed + static_cast<size_t>(t) * 2560,
-                                   act_q_ + static_cast<size_t>(t) * 2560,
-                                   act_d_ + static_cast<size_t>(t) * 160,
-                                   act_nb_ + static_cast<size_t>(t) * 640);
+        int32_t exp_off[512];
+        int32_t cur_off = 0;
+        for (int32_t e = 0; e < 512; ++e) {
+            exp_off[e] = cur_off;
+            cur_off += exp_cnt[e];
         }
+        MoeMissItem* sorted_misses = moe_misses_sorted_.data();
+        for (int32_t i = 0; i < n_miss; ++i) {
+            int32_t e = misses[i].e;
+            sorted_misses[exp_off[e]++] = misses[i];
+        }
+        misses = sorted_misses;
     }
 
-    uint16_t* h_y_out = reinterpret_cast<uint16_t*>(h_cpu_upload_);
+    cpu_pool_.run_quantize_batch(h_mixed, tok_needed, act_q_, act_d_, act_nb_, M);
+
+    uint16_t* h_y_out = static_cast<uint16_t*>(h_cpu_upload_);
     int32_t* upload_pairs = moe_upload_pairs_.data();
     int32_t n_jobs = 0;
     for (int32_t i = 0; i < n_miss;) {
@@ -1812,9 +1876,9 @@ void Qwen4ExpGfx1201Engine::adapt_vram_experts(const int32_t* routed_ids, int32_
                 if (s >= 0) {
                     mw.slot_last_used[s] = step_counter_;
                 }
-            } else if (swaps_done < max_swaps && mw.hit_count[e] >= min_hits) {
+            } else if (swaps_done < max_swaps && mw.in_gpu_cold[e] && mw.hit_count[e] >= min_hits) {
                 int best_s = -1;
-                uint32_t best_age = step_counter_;
+                uint32_t best_age = (step_counter_ > 8) ? (step_counter_ - 8) : 0;
                 for (int s = 0; s < mw.n_dyn; ++s) {
                     int32_t cand_old = mw.slot_exp[s];
                     if (mw.slot_last_used[s] < best_age &&
@@ -1825,6 +1889,7 @@ void Qwen4ExpGfx1201Engine::adapt_vram_experts(const int32_t* routed_ids, int32_
                 }
                 if (best_s >= 0) {
                     int32_t old_e = mw.slot_exp[best_s];
+                    uint32_t old_hits = (old_e >= 0 && old_e < 512) ? mw.hit_count[old_e] : 0;
                     for (int k = 0; k < 6; ++k) mw.h_ptrs_prefill[old_e * 6 + k] = 0;
                     if (mw.in_gpu_cold[old_e] && mw.host_dev_ptr[old_e]) {
                         uint8_t* old_hdev = mw.host_dev_ptr[old_e];
@@ -1856,16 +1921,17 @@ void Qwen4ExpGfx1201Engine::adapt_vram_experts(const int32_t* routed_ids, int32_
                     mw.dyn_slot[e] = static_cast<int16_t>(best_s);
                     mw.slot_exp[best_s] = e;
                     mw.slot_last_used[best_s] = step_counter_;
+                    mw.hit_count[e] = std::max(mw.hit_count[e], old_hits + min_hits);
                     ptrs_dirty = true;
                     swaps_done++;
                 }
             }
         }
         if (ptrs_dirty) {
-            HIP_CHECK(hipMemcpyAsync(mw.d_ptrs, mw.h_ptrs.data(), mw.h_ptrs.size() * sizeof(int64_t),
+            HIP_CHECK(hipMemcpyAsync(mw.d_ptrs, mw.h_ptrs, 512 * 6 * sizeof(int64_t),
                                      hipMemcpyHostToDevice, nullptr));
-            HIP_CHECK(hipMemcpyAsync(mw.d_ptrs_prefill, mw.h_ptrs_prefill.data(),
-                                     mw.h_ptrs_prefill.size() * sizeof(int64_t), hipMemcpyHostToDevice, nullptr));
+            HIP_CHECK(hipMemcpyAsync(mw.d_ptrs_prefill, mw.h_ptrs_prefill,
+                                     512 * 6 * sizeof(int64_t), hipMemcpyHostToDevice, nullptr));
         }
     }
 }
@@ -1893,12 +1959,21 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     if (std::getenv("STRATA_NVFP4_TIMING") != nullptr) {
         for (int i = 0; i < 9; ++i) HIP_CHECK(hipEventCreate(&ev_prof_[i]));
     }
+    int64_t* h_ptrs_arena =
+        static_cast<int64_t*>(host_pinned_alloc(49ULL * 2ULL * 512ULL * 6ULL * sizeof(int64_t)));
+    for (int l = 0; l < 48; ++l) {
+        layers_[l].moe.h_ptrs = h_ptrs_arena + static_cast<size_t>(l * 2 + 0) * (512 * 6);
+        layers_[l].moe.h_ptrs_prefill = h_ptrs_arena + static_cast<size_t>(l * 2 + 1) * (512 * 6);
+    }
+    mtp_.moe.h_ptrs = h_ptrs_arena + 96ULL * (512 * 6);
+    mtp_.moe.h_ptrs_prefill = h_ptrs_arena + 97ULL * (512 * 6);
     cpu_jobs_.resize(512 + (B * 10) / static_cast<size_t>(kMaxJobToks) + 32);
     h_all_routed_ids_.resize(48 * B * 10, 0);
     ple_miss_offs_.resize(B * 16);
     ple_miss_cache_dsts_.resize(B * 16);
     ple_miss_user_dsts_.resize(B * 16);
     moe_misses_.resize(B * 10);
+    moe_misses_sorted_.resize(B * 10);
     moe_tok_needed_.resize(B, 0);
     moe_upload_pairs_.resize(B * 10);
 
@@ -1935,6 +2010,7 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     const size_t upload_bytes = B * 10 * (2560 * sizeof(uint16_t) + sizeof(int32_t));
     d_cpu_upload_ = gpu_alloc(upload_bytes);
     h_cpu_upload_ = host_pinned_alloc(upload_bytes);
+    HIP_CHECK(hipHostGetDevicePointer(&d_cpu_upload_host_dev_, h_cpu_upload_, 0));
 
     d_x_stream_a_ = gpu_alloc(B * 10240 * sizeof(uint16_t));
     d_x_stream_b_ = gpu_alloc(B * 10240 * sizeof(uint16_t));
@@ -1945,7 +2021,7 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     d_attn_out_ = gpu_alloc(B * 2560 * sizeof(uint16_t));
     d_mlp_out_ = gpu_alloc(B * 2560 * sizeof(uint16_t));
     d_final_hidden_ = gpu_alloc(2560 * sizeof(uint16_t));
-    d_logits_bf16_ = gpu_alloc(4ULL * 248320 * sizeof(uint16_t));
+    d_logits_bf16_ = gpu_alloc(16ULL * 248320 * sizeof(uint16_t));
     d_proj_scratch_ = gpu_alloc(B * 16480 * sizeof(uint16_t));
     d_ple_gvn_ = gpu_alloc(B * 10240 * sizeof(uint16_t));
 
@@ -1993,7 +2069,8 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     const size_t gdn_conv_bytes = 3 * 10240 * sizeof(uint16_t);
     const size_t gdn_state_bytes = 48 * 128 * 128 * sizeof(float);
     const size_t raw_k_bytes = 1024ULL * 128 * sizeof(uint16_t);
-    recurrent_ckpt_bytes_ = ple_conv_bytes + 36ULL * (2 * gdn_conv_bytes + gdn_state_bytes);
+    conv_ckpt_bytes_ = ple_conv_bytes + 36ULL * 2 * gdn_conv_bytes;
+    recurrent_ckpt_bytes_ = conv_ckpt_bytes_ + 36ULL * gdn_state_bytes;
     raw_k_arena_bytes_ = static_cast<size_t>(kNumQsaCaches) * raw_k_bytes;
     recurrent_arena_bytes_ = recurrent_ckpt_bytes_ + raw_k_arena_bytes_;
     d_recurrent_arena_ = gpu_alloc(recurrent_ckpt_bytes_, true);
@@ -2005,9 +2082,11 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
         h_turn_ckpt_ = h_turn;
         host_mallocs_.push_back(h_turn);
     }
-    uint8_t* rec_cur = static_cast<uint8_t*>(d_recurrent_arena_);
-    d_ple_conv_state_ = rec_cur;
-    rec_cur += ple_conv_bytes;
+    uint8_t* rec_conv_cur = static_cast<uint8_t*>(d_recurrent_arena_);
+    uint8_t* rec_state_cur = static_cast<uint8_t*>(d_recurrent_arena_) + conv_ckpt_bytes_;
+    uint8_t* ckpt_state_cur = static_cast<uint8_t*>(d_recurrent_ckpt_) + conv_ckpt_bytes_;
+    d_ple_conv_state_ = rec_conv_cur;
+    rec_conv_cur += ple_conv_bytes;
 
     // Phase 2: GDN
     {
@@ -2021,21 +2100,18 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
     d_gdn_z_b_ = static_cast<uint16_t*>(d_gdn_qkv_) + B * 10240;
     d_gdn_a_b_ = static_cast<uint16_t*>(d_gdn_qkv_) + B * 16384;
     d_gdn_b_b_ = static_cast<uint16_t*>(d_gdn_qkv_) + B * 16432;
-    const size_t gdn_verify_layer_bytes = 4ULL * 16480 * sizeof(uint16_t);
-    d_gdn_verify_arena_ = gpu_alloc(36ULL * gdn_verify_layer_bytes);
-    uint8_t* ver_cur = static_cast<uint8_t*>(d_gdn_verify_arena_);
     for (int l = 0; l < 48; ++l) {
         if (l % 4 != 3) {
-            d_gdn_conv_in_[l] = rec_cur;
-            init_gdn_conv_in_[l] = rec_cur;
-            rec_cur += gdn_conv_bytes;
-            d_gdn_conv_out_[l] = rec_cur;
-            init_gdn_conv_out_[l] = rec_cur;
-            rec_cur += gdn_conv_bytes;
-            d_gdn_state_[l] = rec_cur;
-            rec_cur += gdn_state_bytes;
-            d_gdn_verify_qkv_[l] = ver_cur;
-            ver_cur += gdn_verify_layer_bytes;
+            d_gdn_conv_in_[l] = rec_conv_cur;
+            init_gdn_conv_in_[l] = rec_conv_cur;
+            rec_conv_cur += gdn_conv_bytes;
+            d_gdn_conv_out_[l] = rec_conv_cur;
+            init_gdn_conv_out_[l] = rec_conv_cur;
+            rec_conv_cur += gdn_conv_bytes;
+            d_gdn_state_[l] = rec_state_cur;
+            rec_state_cur += gdn_state_bytes;
+            d_gdn_state_ckpt_[l] = ckpt_state_cur;
+            ckpt_state_cur += gdn_state_bytes;
         }
     }
 
@@ -2046,8 +2122,8 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
         d_qsa_q_ = ph_base + off;        off += align256(B * 6144 * sizeof(uint16_t));
         d_qsa_attn_raw_ = ph_base + off; off += align256(B * 6144 * sizeof(uint16_t));
         d_qsa_sel_ids_ = ph_base + off;  off += align256(B * 512 * sizeof(int32_t));
-        d_qsa_scores_ = ph_base + off;   off += align256(qsa_scores_bytes);
     }
+    d_qsa_scores_ = gpu_alloc(qsa_scores_bytes, true);
     d_qsa_k_ = static_cast<uint16_t*>(d_qsa_qg_) + 12288;
     d_qsa_v_ = static_cast<uint16_t*>(d_qsa_qg_) + 12800;
     d_qsa_idx_qk_ = static_cast<uint16_t*>(d_qsa_qg_) + 13312;
@@ -2193,11 +2269,35 @@ void Qwen4ExpGfx1201Engine::alloc_state_and_scratch() {
 
     d_mtp_r_ring_ = gpu_alloc(static_cast<size_t>(kMtpRingCap) * 10240 * sizeof(uint16_t), true);
     d_mtp_r_state_ = gpu_alloc(10240 * sizeof(uint16_t), true);
-    d_ple_verify_gvn_ = gpu_alloc(4 * 10240 * sizeof(uint16_t), true);
-    d_argmax_summary_ = gpu_alloc(4 * sizeof(strata::kernels::Nvfp4ArgmaxSummary));
+    ensure_verify_capacity(32);
     d_moe_gpu_align_ids_ = gpu_alloc(B * 10 * sizeof(int32_t));
     d_mtp_dvocab_ = static_cast<int32_t*>(gpu_alloc(65536 * sizeof(int32_t), true));
     ple_cache_.resize(kPleCacheSlots);
+}
+
+void Qwen4ExpGfx1201Engine::ensure_verify_capacity(int32_t needed_m) {
+    if (needed_m <= verify_cap_) return;
+    auto free_tracked = [&](void* ptr) {
+        if (!ptr) return;
+        (void) hipFree(ptr);
+        auto it = std::find(vram_allocs_.begin(), vram_allocs_.end(), ptr);
+        if (it != vram_allocs_.end()) vram_allocs_.erase(it);
+    };
+    free_tracked(d_gdn_verify_arena_);
+    free_tracked(d_argmax_summary_);
+    int32_t new_cap = std::max<int32_t>(32, (needed_m + 15) & ~15);
+    const size_t gdn_verify_layer_bytes = static_cast<size_t>(new_cap) * 16480 * sizeof(uint16_t);
+    d_gdn_verify_arena_ = gpu_alloc(36ULL * gdn_verify_layer_bytes);
+    uint8_t* ver_cur = static_cast<uint8_t*>(d_gdn_verify_arena_);
+    for (int l = 0; l < 48; ++l) {
+        if (l % 4 != 3) {
+            d_gdn_verify_qkv_[l] = ver_cur;
+            ver_cur += gdn_verify_layer_bytes;
+        }
+    }
+    d_argmax_summary_ = gpu_alloc(static_cast<size_t>(new_cap) * sizeof(strata::kernels::Nvfp4ArgmaxSummary));
+    verify_summaries_.resize(static_cast<size_t>(new_cap));
+    verify_cap_ = new_cap;
 }
 
 void Qwen4ExpGfx1201Engine::populate_rope_range(int32_t p_begin, int32_t p_end) {
@@ -2347,10 +2447,10 @@ strata::core::VmmChunk Qwen4ExpGfx1201Engine::take_one_dynamic_expert_chunk() {
             }
         }
         if (dirty) {
-            HIP_CHECK(hipMemcpy(mw.d_ptrs, mw.h_ptrs.data(), mw.h_ptrs.size() * sizeof(int64_t),
+            HIP_CHECK(hipMemcpy(mw.d_ptrs, mw.h_ptrs, 512 * 6 * sizeof(int64_t),
                                 hipMemcpyHostToDevice));
-            HIP_CHECK(hipMemcpy(mw.d_ptrs_prefill, mw.h_ptrs_prefill.data(),
-                                mw.h_ptrs_prefill.size() * sizeof(int64_t), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(mw.d_ptrs_prefill, mw.h_ptrs_prefill,
+                                512 * 6 * sizeof(int64_t), hipMemcpyHostToDevice));
         }
     }
     HIP_CHECK(hipDeviceSynchronize());
@@ -2368,16 +2468,17 @@ bool Qwen4ExpGfx1201Engine::map_kv_vmm_with_reclaim(size_t offset, size_t length
     int64_t lo = static_cast<int64_t>(offset / gran);
     int64_t hi = static_cast<int64_t>((offset + length) / gran);
     auto take_fn = [&]() -> strata::core::VmmChunk {
+        strata::core::VmmChunk h = take_one_dynamic_expert_chunk();
+        if (h != 0) return h;
         size_t free_vram = 0, total_vram = 0;
-        const size_t min_free = static_cast<size_t>(std::max(512, vram_reserve_mib_ - 256)) * 1024ULL * 1024ULL;
+        const size_t min_free = static_cast<size_t>(std::max(512, vram_reserve_mib_)) * 1024ULL * 1024ULL;
         if (hipMemGetInfo(&free_vram, &total_vram) == hipSuccess &&
             free_vram >= gran + min_free) {
             return 0;
         }
-        return take_one_dynamic_expert_chunk();
+        return 0;
     };
-    if (kv_vmm_range_.map_range(lo, hi, take_fn)) return true;
-    return kv_vmm_range_.map_range(lo, hi, [&]() { return take_one_dynamic_expert_chunk(); });
+    return kv_vmm_range_.map_range(lo, hi, take_fn);
 }
 
 void Qwen4ExpGfx1201Engine::ensure_context_capacity(int32_t needed_seq) {
@@ -2690,7 +2791,8 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
     int layer_vram_cnt[48]{};
     size_t free_vram = 0, total_vram = 0;
     HIP_CHECK(hipMemGetInfo(&free_vram, &total_vram));
-    const size_t reserve_vram = static_cast<size_t>(vram_reserve_mib_) * 1024ULL * 1024ULL;
+    // Account for post-query per-layer pointer tables, VMM 2 MiB slab rounding, and DRM graphics headroom
+    const size_t reserve_vram = static_cast<size_t>(vram_reserve_mib_ + 512) * 1024ULL * 1024ULL;
     int max_vram_experts = (free_vram > reserve_vram)
                                ? static_cast<int>((free_vram - reserve_vram) / EXP_STRIDE_BYTES)
                                : (vram_expert_layers_ * 512);
@@ -2705,6 +2807,17 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
             expert_profile_path_ = cand_model;
         } else if (std::filesystem::exists("data/expert-profile.bin", ec)) {
             expert_profile_path_ = "data/expert-profile.bin";
+        } else {
+            std::filesystem::path exe_p = std::filesystem::read_symlink("/proc/self/exe", ec);
+            if (!ec) {
+                std::filesystem::path p1 = exe_p.parent_path() / "data" / "expert-profile.bin";
+                std::filesystem::path p2 = exe_p.parent_path().parent_path() / "data" / "expert-profile.bin";
+                if (std::filesystem::exists(p1, ec)) {
+                    expert_profile_path_ = p1.string();
+                } else if (std::filesystem::exists(p2, ec)) {
+                    expert_profile_path_ = p2.string();
+                }
+            }
         }
     }
 
@@ -2756,6 +2869,7 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
     size_t total_gpu_cold_experts = 0;
     size_t total_cpu_host_experts = 0;
     int max_layer_pinned = 0;
+    int max_layer_vram = 0;
     size_t layer_gpu_cold_off[48]{};
     size_t layer_cpu_host_off[48]{};
     for (int l = 0; l < 48; ++l) {
@@ -2775,6 +2889,7 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
             }
         }
         max_layer_pinned = std::max(max_layer_pinned, n_pinned);
+        max_layer_vram = std::max(max_layer_vram, n_vram);
     }
 
     const int n_io_threads = std::max(1, cpu_pool_.num_threads());
@@ -2785,6 +2900,10 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
         std::vector<std::thread> pf_workers;
         pf_workers.reserve(n_io_threads - 1);
         auto touch_range = [&](int tid) {
+            if (tid > 0) {
+                int c = cpu_pool_.core_for_thread(tid);
+                if (c >= 0) strata::kernels::cpu::pin_current_thread(c);
+            }
             size_t p0 = (static_cast<size_t>(tid) * n_pages) / static_cast<size_t>(n_io_threads);
             size_t p1 = (static_cast<size_t>(tid + 1) * n_pages) / static_cast<size_t>(n_io_threads);
             for (size_t p = p0; p < p1; ++p) {
@@ -2827,11 +2946,17 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
         prefault_hugepages(cpu_host_base, total_cpu_host_bytes);
     }
 
-    uint8_t* pin_vram_stage = nullptr;
-    if (max_layer_pinned > 0) {
-        HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&pin_vram_stage),
-                                static_cast<size_t>(max_layer_pinned) * EXP_STRIDE_BYTES,
-                                hipHostMallocDefault));
+    uint8_t* pin_vram_stage[2] = {nullptr, nullptr};
+    hipStream_t upload_stream = nullptr;
+    hipEvent_t ev_stage_done[2] = {nullptr, nullptr};
+    if (max_layer_vram > 0) {
+        HIP_CHECK(hipStreamCreateWithFlags(&upload_stream, hipStreamNonBlocking));
+        for (int b = 0; b < 2; ++b) {
+            HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&pin_vram_stage[b]),
+                                    static_cast<size_t>(max_layer_vram) * EXP_STRIDE_BYTES,
+                                    hipHostMallocDefault));
+            HIP_CHECK(hipEventCreateWithFlags(&ev_stage_done[b], hipEventDisableTiming));
+        }
     }
 
     struct ExpSlice9 {
@@ -2894,10 +3019,16 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
         lw.moe.vram_base = vram_base;
         lw.moe.dyn_vram_base = dyn_vram_base;
 
+        const int stage_idx = l & 1;
+        uint8_t* cur_stage = pin_vram_stage[stage_idx];
+        if (cur_stage && l >= 2) {
+            HIP_CHECK(hipEventSynchronize(ev_stage_done[stage_idx]));
+        }
+
         uint8_t* layer_gpu_cold = gpu_cold_host_base + layer_gpu_cold_off[l] * EXP_STRIDE_BYTES;
         uint8_t* layer_cpu_host = cpu_host_base + layer_cpu_host_off[l] * EXP_STRIDE_BYTES;
-        lw.moe.h_ptrs.assign(512 * 6, 0);
-        lw.moe.h_ptrs_prefill.assign(512 * 6, 0);
+        std::memset(lw.moe.h_ptrs, 0, 512 * 6 * sizeof(int64_t));
+        std::memset(lw.moe.h_ptrs_prefill, 0, 512 * 6 * sizeof(int64_t));
         lw.moe.h_s2.resize(512 * 3);
         std::string epfx_base = "model.language_model.layers." + std::to_string(l) + ".mlp.experts.";
 
@@ -2932,7 +3063,7 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
             int32_t rk = vram_rank[l][e];
             bool is_pinned = (rk >= 0 && rk < n_pinned);
             if (is_pinned) {
-                dst_ptr[e] = pin_vram_stage + static_cast<size_t>(rk) * EXP_STRIDE_BYTES;
+                dst_ptr[e] = cur_stage + static_cast<size_t>(rk) * EXP_STRIDE_BYTES;
             } else if (lw.moe.in_gpu_cold[e]) {
                 int s = gc_idx++;
                 gpu_cold_slot[l][e] = s;
@@ -2945,19 +3076,22 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
             }
         }
 
-        for (int idx = 0; idx < 512; ++idx) {
-            int e = sorted_e[idx];
-            const ExpSlice9& es = exp_slices[e];
-            pread_exact(shard_fds[es.gs2.shard_idx], &lw.moe.h_s2[e * 3 + 0], sizeof(float), es.gs2.file_offset);
-            pread_exact(shard_fds[es.us2.shard_idx], &lw.moe.h_s2[e * 3 + 1], sizeof(float), es.us2.file_offset);
-            pread_exact(shard_fds[es.ds2.shard_idx], &lw.moe.h_s2[e * 3 + 2], sizeof(float), es.ds2.file_offset);
-        }
-
         std::vector<std::thread> io_workers;
         io_workers.reserve(n_io_threads - 1);
         auto load_expert_chunk = [&](int tid) {
+            if (tid > 0) {
+                int c = cpu_pool_.core_for_thread(tid);
+                if (c >= 0) strata::kernels::cpu::pin_current_thread(c);
+            }
             int idx_begin = (tid * 512) / n_io_threads;
             int idx_end = ((tid + 1) * 512) / n_io_threads;
+            for (int idx = idx_begin; idx < idx_end; ++idx) {
+                int e = sorted_e[idx];
+                const ExpSlice9& es = exp_slices[e];
+                pread_exact(shard_fds[es.gs2.shard_idx], &lw.moe.h_s2[e * 3 + 0], sizeof(float), es.gs2.file_offset);
+                pread_exact(shard_fds[es.us2.shard_idx], &lw.moe.h_s2[e * 3 + 1], sizeof(float), es.us2.file_offset);
+                pread_exact(shard_fds[es.ds2.shard_idx], &lw.moe.h_s2[e * 3 + 2], sizeof(float), es.ds2.file_offset);
+            }
             for (int idx = idx_begin; idx < idx_end; ++idx) {
                 int e = sorted_e[idx];
                 const ExpSlice9& es = exp_slices[e];
@@ -2973,6 +3107,10 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
                 pread_exact(shard_fds[es.dw.shard_idx], dst + EXP_OFF_DOWN_W, EXP_W_BYTES, es.dw.file_offset);
                 pread_exact(shard_fds[es.gw.shard_idx], dst + EXP_OFF_GATE_W, EXP_W_BYTES, es.gw.file_offset);
                 pread_exact(shard_fds[es.uw.shard_idx], dst + EXP_OFF_UP_W, EXP_W_BYTES, es.uw.file_offset);
+                int32_t rk = vram_rank[l][e];
+                if (rk >= n_pinned && rk < n_vram && cur_stage) {
+                    std::memcpy(cur_stage + static_cast<size_t>(rk) * EXP_STRIDE_BYTES, dst, EXP_STRIDE_BYTES);
+                }
             }
         };
         for (int t = 1; t < n_io_threads; ++t) {
@@ -2985,10 +3123,19 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
             (void) ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
         }
 
-        if (n_pinned > 0) {
-            HIP_CHECK(hipMemcpy(vram_base, pin_vram_stage,
-                                static_cast<size_t>(n_pinned) * EXP_STRIDE_BYTES,
-                                hipMemcpyHostToDevice));
+        if (n_pinned > 0 && cur_stage) {
+            HIP_CHECK(hipMemcpyAsync(vram_base, cur_stage,
+                                     static_cast<size_t>(n_pinned) * EXP_STRIDE_BYTES,
+                                     hipMemcpyHostToDevice, upload_stream));
+        }
+        if (n_dyn > 0 && cur_stage && lw.moe.dyn_vram_base) {
+            HIP_CHECK(hipMemcpyAsync(lw.moe.dyn_vram_base,
+                                     cur_stage + static_cast<size_t>(n_pinned) * EXP_STRIDE_BYTES,
+                                     static_cast<size_t>(n_dyn) * EXP_STRIDE_BYTES,
+                                     hipMemcpyHostToDevice, upload_stream));
+        }
+        if (cur_stage) {
+            HIP_CHECK(hipEventRecord(ev_stage_done[stage_idx], upload_stream));
         }
         for (int e = 0; e < 512; ++e) {
             int32_t rk = vram_rank[l][e];
@@ -2999,8 +3146,6 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
                 lw.moe.dyn_slot[e] = -1;
             } else if (is_dyn) {
                 int s = rk - n_pinned;
-                uint8_t* edev = lw.moe.dyn_vram_base + static_cast<size_t>(s) * EXP_STRIDE_BYTES;
-                HIP_CHECK(hipMemcpy(edev, lw.moe.host_cpu_ptr[e], EXP_STRIDE_BYTES, hipMemcpyHostToDevice));
                 lw.moe.in_vram[e] = true;
                 lw.moe.dyn_slot[e] = static_cast<int16_t>(s);
                 lw.moe.slot_exp[s] = e;
@@ -3021,8 +3166,13 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
         }
     }
 
-    if (pin_vram_stage) {
-        HIP_CHECK(hipHostFree(pin_vram_stage));
+    if (upload_stream) {
+        HIP_CHECK(hipStreamSynchronize(upload_stream));
+        for (int b = 0; b < 2; ++b) {
+            if (ev_stage_done[b]) HIP_CHECK(hipEventDestroy(ev_stage_done[b]));
+            if (pin_vram_stage[b]) HIP_CHECK(hipHostFree(pin_vram_stage[b]));
+        }
+        HIP_CHECK(hipStreamDestroy(upload_stream));
     }
 
     uint8_t* gpu_cold_host_dev = nullptr;
@@ -3066,13 +3216,13 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
                 for (int k = 0; k < 6; ++k) lw.moe.h_ptrs_prefill[e * 6 + k] = lw.moe.h_ptrs[e * 6 + k];
             }
         }
-        lw.moe.d_ptrs = gpu_alloc(lw.moe.h_ptrs.size() * sizeof(int64_t));
-        lw.moe.d_ptrs_prefill = gpu_alloc(lw.moe.h_ptrs_prefill.size() * sizeof(int64_t));
+        lw.moe.d_ptrs = gpu_alloc(512 * 6 * sizeof(int64_t));
+        lw.moe.d_ptrs_prefill = gpu_alloc(512 * 6 * sizeof(int64_t));
         lw.moe.d_s2 = gpu_alloc(lw.moe.h_s2.size() * sizeof(float));
-        HIP_CHECK(hipMemcpy(lw.moe.d_ptrs, lw.moe.h_ptrs.data(), lw.moe.h_ptrs.size() * sizeof(int64_t),
+        HIP_CHECK(hipMemcpy(lw.moe.d_ptrs, lw.moe.h_ptrs, 512 * 6 * sizeof(int64_t),
                             hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(lw.moe.d_ptrs_prefill, lw.moe.h_ptrs_prefill.data(),
-                            lw.moe.h_ptrs_prefill.size() * sizeof(int64_t), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(lw.moe.d_ptrs_prefill, lw.moe.h_ptrs_prefill,
+                            512 * 6 * sizeof(int64_t), hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(lw.moe.d_s2, lw.moe.h_s2.data(), lw.moe.h_s2.size() * sizeof(float),
                             hipMemcpyHostToDevice));
     }
@@ -3126,6 +3276,10 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
         std::vector<std::thread> io_workers;
         io_workers.reserve(n_io_threads - 1);
         auto load_mtp_chunk = [&](int tid) {
+            if (tid > 0) {
+                int c = cpu_pool_.core_for_thread(tid);
+                if (c >= 0) strata::kernels::cpu::pin_current_thread(c);
+            }
             int idx_begin = (tid * 512) / n_io_threads;
             int idx_end = ((tid + 1) * 512) / n_io_threads;
             for (int idx = idx_begin; idx < idx_end; ++idx) {
@@ -3156,8 +3310,8 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
         HIP_CHECK(hipHostGetDevicePointer(&dptr, mtp_host_base, 0));
         uint8_t* mtp_host_dev = static_cast<uint8_t*>(dptr);
 
-        mtp_.moe.h_ptrs.assign(512 * 6, 0);
-        mtp_.moe.h_ptrs_prefill.assign(512 * 6, 0);
+        std::memset(mtp_.moe.h_ptrs, 0, 512 * 6 * sizeof(int64_t));
+        std::memset(mtp_.moe.h_ptrs_prefill, 0, 512 * 6 * sizeof(int64_t));
         for (int e = 0; e < 512; ++e) {
             mtp_.moe.in_vram[e] = false;
             mtp_.moe.in_gpu_cold[e] = true;
@@ -3171,9 +3325,9 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
             mtp_.moe.h_ptrs[e * 6 + 4] = reinterpret_cast<int64_t>(edev + MTP_OFF_DOWN_W);
             mtp_.moe.h_ptrs[e * 6 + 5] = reinterpret_cast<int64_t>(edev + MTP_OFF_DOWN_S);
         }
-        mtp_.moe.d_ptrs = gpu_alloc(mtp_.moe.h_ptrs.size() * sizeof(int64_t));
-        mtp_.moe.d_ptrs_prefill = gpu_alloc(mtp_.moe.h_ptrs_prefill.size() * sizeof(int64_t), true);
-        HIP_CHECK(hipMemcpy(mtp_.moe.d_ptrs, mtp_.moe.h_ptrs.data(), mtp_.moe.h_ptrs.size() * sizeof(int64_t),
+        mtp_.moe.d_ptrs = gpu_alloc(512 * 6 * sizeof(int64_t));
+        mtp_.moe.d_ptrs_prefill = gpu_alloc(512 * 6 * sizeof(int64_t), true);
+        HIP_CHECK(hipMemcpy(mtp_.moe.d_ptrs, mtp_.moe.h_ptrs, 512 * 6 * sizeof(int64_t),
                             hipMemcpyHostToDevice));
         if (const char* env_tk = std::getenv("STRATA_MTP_TOPK")) {
             mtp_topk_ = std::clamp(std::atoi(env_tk), 1, 10);
@@ -3187,7 +3341,20 @@ void Qwen4ExpGfx1201Engine::load_weights_from_safetensors() {
             std::error_code dv_ec;
             if (!std::filesystem::exists(dv_path, dv_ec)) {
                 std::string cand2 = model_dir_ + "/draft_vocab_en.bin";
-                if (std::filesystem::exists(cand2, dv_ec)) dv_path = cand2;
+                if (std::filesystem::exists(cand2, dv_ec)) {
+                    dv_path = cand2;
+                } else {
+                    std::filesystem::path exe_p = std::filesystem::read_symlink("/proc/self/exe", dv_ec);
+                    if (!dv_ec) {
+                        std::filesystem::path p1 = exe_p.parent_path() / "data" / "draft_vocab_en.bin";
+                        std::filesystem::path p2 = exe_p.parent_path().parent_path() / "data" / "draft_vocab_en.bin";
+                        if (std::filesystem::exists(p1, dv_ec)) {
+                            dv_path = p1.string();
+                        } else if (std::filesystem::exists(p2, dv_ec)) {
+                            dv_path = p2.string();
+                        }
+                    }
+                }
             }
             int dv_fd = ::open(dv_path.c_str(), O_RDONLY);
             if (dv_fd >= 0) {

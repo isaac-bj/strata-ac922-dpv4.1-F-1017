@@ -21,7 +21,7 @@ public:
 
     // Online hardware-aware latency & acceptance feedback (DSpark Algorithm 1 calibration).
     // drafted == 0 records baseline single-token step_token latency.
-    // drafted in [1, 3] records verification batch M = 1 + drafted latency and accepted prefix count.
+    // drafted >= 1 records verification batch M = 1 + drafted latency and accepted prefix count.
     void observe_step(int32_t drafted, int32_t accepted, double step_ms);
     void observe_target_confidence(float prob, float margin);
 
@@ -50,16 +50,17 @@ private:
     bool is_new_number_head(int32_t prev2_id, int32_t prev_id, int32_t cand_id);
     bool is_content_token(int32_t id);
 
+    double estimate_verify_ms(int32_t drafted) const;
     double estimate_step_confidence(const StepStats& st, int32_t prev2_id, int32_t prev_id, int32_t next_id);
-    int32_t schedule_prefix(const StepStats* steps, int32_t num_cand) const;
+    int32_t schedule_prefix(const std::vector<StepStats>& steps) const;
 
     const strata::artifact::QwenTokenizer& tokenizer_;
     std::unordered_map<uint64_t, uint8_t> rejected_set_;
     std::unordered_map<int32_t, std::string> tok_str_cache_;
 
-    // DSpark hardware cost model (EMA wall-clock ms for drafted = 0, 1, 2, 3)
+    // DSpark hardware cost model (EMA wall-clock ms for drafted = 0, 1, 2, ..., dynamically extended)
     // On R9700 + 7950X3D with zero-copy GDN ping-pong + hybrid PCIe MoE verification:
-    std::array<double, 4> ema_step_ms_{{24.2, 29.5, 31.0, 32.5}};
+    std::vector<double> ema_step_ms_{24.2, 29.5, 31.0, 32.5};
     double ema_rollback_ms_ = 2.2;
     float last_target_prob_ = 1.0f;
     float last_target_margin_ = 10.0f;
@@ -67,7 +68,7 @@ private:
     // Online empirical survival rate per Markov order bucket:
     // bucket 0: L=1, bucket 1: L=2, bucket 2: L=3, bucket 3: L=4, bucket 4: L>=5
     std::array<double, 5> bucket_emp_survival_{{0.58, 0.72, 0.84, 0.91, 0.96}};
-    std::array<int32_t, 3> last_draft_buckets_{{0, 0, 0}};
+    std::vector<int32_t> last_draft_buckets_;
     int32_t last_draft_len_ = 0;
 };
 

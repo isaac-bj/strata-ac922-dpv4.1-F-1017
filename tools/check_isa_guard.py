@@ -40,6 +40,7 @@ WIDE_PUBLIC = {
     "tq_rows_avx512",                        # trellis rows (tq_cpu.cpp: behind cpu_avx512_ok())
     "quantize_act_bf16_2560_avx512", "gu_tile32_modelopt_avx512",
     "down_tile80_modelopt_avx512", "down_tile80_decode_modelopt_avx512",
+    "gu_tile32_fp8_avx512", "down_tile80_decode_fp8_avx512",
 }
 WIDE_OBJECTS = ("expert.cpp", "iq_avx512.cpp", "iq_avx2.cpp", "q2_avx2.cpp", "kq_avx2.cpp", "nvfp4_avx512.cpp", "tq_avx512.cpp", "nvfp4_modelopt_avx512.cpp")
 # Also compiled above the baseline (AVX2/FMA for nvfp4_avx2, AVX for the older CPUs' rows) and reached only behind a CPU

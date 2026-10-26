@@ -284,16 +284,17 @@ int run_nvfp4(int argc, char** argv) {
                     continue;
                 }
                 if (line.empty()) continue;
+                const bool is_quit = (line == "QUIT");
                 {
                     std::lock_guard<std::mutex> lk(q_mtx);
                     cmd_q.push_back(std::move(line));
                 }
                 q_cv.notify_one();
+                if (is_quit) break;
             }
             stdin_eof.store(true, std::memory_order_relaxed);
             q_cv.notify_all();
         });
-        reader_thr.detach();
 
         while (true) {
             std::string line;
@@ -461,6 +462,8 @@ int run_nvfp4(int argc, char** argv) {
                 int generated = 0;
                 int spec_accepted_total = 0;
                 int spec_drafted_total = 0;
+                int spec_max_accepted_k = 0;
+                int spec_max_drafted_k = 0;
                 const char* finish_reason = cancelled ? "cancel" : "length";
 
                 for (int step = 0; !cancelled && step < req_max_new;) {
@@ -501,7 +504,7 @@ int run_nvfp4(int argc, char** argv) {
                         if (!mtp_only) {
                             drafter.draft(next_tok, N, history, spec_ngram, draft);
                         }
-                        if (engine.has_mtp() && eff_k > 0 && static_cast<int32_t>(draft.size()) < std::min<int32_t>(2, eff_k)) {
+                        if (draft.empty() && engine.has_mtp() && eff_k > 0) {
                             engine.draft_mtp(next_tok, history, eff_k, mtp_min_prob, draft);
                             used_mtp = !draft.empty();
                         }
@@ -518,7 +521,10 @@ int run_nvfp4(int argc, char** argv) {
                         engine.save_recurrent_ckpt();
 
                         int32_t pos0 = static_cast<int32_t>(history.size());
-                        int32_t b_toks[4], b_p0[4], b_p1[4], preds[4]{};
+                        std::vector<int32_t> b_toks(static_cast<size_t>(M));
+                        std::vector<int32_t> b_p0(static_cast<size_t>(M));
+                        std::vector<int32_t> b_p1(static_cast<size_t>(M));
+                        std::vector<int32_t> preds(static_cast<size_t>(M), 0);
                         for (int32_t j = 0; j < M; ++j) {
                             int32_t tk = (j == 0) ? next_tok : draft[j - 1];
                             b_toks[j] = tk;
@@ -526,14 +532,17 @@ int run_nvfp4(int argc, char** argv) {
                             b_p1[j] = (history.size() >= 1) ? history[history.size() - 1] : strata::kernels::TOKEN_NULL;
                             history.push_back(tk);
                         }
-                        (void) engine.step_prefill_batch(b_toks, b_p0, b_p1, M, pos0, true, nullptr, preds,
-                                                         &req_sp, &history, &req_rng, draft.data());
+                        (void) engine.step_prefill_batch(b_toks.data(), b_p0.data(), b_p1.data(), M, pos0, true,
+                                                         nullptr, preds.data(), &req_sp, &history, &req_rng,
+                                                         draft.data());
 
                         int32_t accepted = 0;
                         while (accepted < K && preds[accepted] == draft[accepted]) {
                             accepted++;
                         }
                         spec_accepted_total += accepted;
+                        spec_max_accepted_k = std::max(spec_max_accepted_k, accepted);
+                        spec_max_drafted_k = std::max(spec_max_drafted_k, K);
                         const int32_t n_adv = 1 + accepted;
                         engine.finish_verify_step(M, n_adv);
                         double ver_ms = std::chrono::duration<double, std::milli>(
@@ -541,6 +550,10 @@ int run_nvfp4(int argc, char** argv) {
                                             .count();
                         if (!used_mtp) {
                             drafter.observe_step(K, accepted, ver_ms);
+                        } else if (ver_ms > 5.0) {
+                            const double mtp_overhead = 4.2 * static_cast<double>(K);
+                            const double pure_ver = std::max(12.0, ver_ms - mtp_overhead);
+                            drafter.observe_step(0, 0, pure_ver / (1.18 + 0.05 * static_cast<double>(K)));
                         }
 
                         if (accepted < K) {
@@ -599,15 +612,16 @@ int run_nvfp4(int argc, char** argv) {
                 std::fflush(stdout);
                 std::fprintf(stderr,
                              "[gfx1201-nvfp4-serve] prompt=%zu (reused=%zu, new=%zu) in %.1f ms (%.1f tok/s) | "
-                             "gen=%d in %.1f ms (%.2f tok/s, spec=%d/%d) | finish=%s\n",
+                             "gen=%d in %.1f ms (%.2f tok/s, spec=%d/%d, max_k=%d/%d) | finish=%s\n",
                              N, reused, N - reused, prefill_ms,
                              (N > reused && prefill_ms > 0.0) ? ((N - reused) * 1000.0 / prefill_ms) : 0.0,
                              generated, decode_ms,
                              (generated > 0 && decode_ms > 0.0) ? (generated * 1000.0 / decode_ms) : 0.0,
-                             spec_accepted_total, spec_drafted_total, finish_reason);
+                             spec_accepted_total, spec_drafted_total, spec_max_accepted_k, spec_max_drafted_k, finish_reason);
                 std::fflush(stderr);
             }
         }
+        if (reader_thr.joinable()) reader_thr.join();
         return 0;
     }
 
@@ -662,6 +676,8 @@ int run_nvfp4(int argc, char** argv) {
     int generated = 0;
     int spec_accepted_total = 0;
     int spec_drafted_total = 0;
+    int spec_max_accepted_k = 0;
+    int spec_max_drafted_k = 0;
 
     for (int step = 0; step < max_new_tokens;) {
         if (next_tok < 0) break;
@@ -681,7 +697,7 @@ int run_nvfp4(int argc, char** argv) {
             if (!mtp_only) {
                 drafter.draft(next_tok, total_prompt, history, spec_ngram, draft);
             }
-            if (engine.has_mtp() && eff_k > 0 && static_cast<int32_t>(draft.size()) < std::min<int32_t>(2, eff_k)) {
+            if (draft.empty() && engine.has_mtp() && eff_k > 0) {
                 engine.draft_mtp(next_tok, history, eff_k, mtp_min_prob, draft);
                 used_mtp = !draft.empty();
             }
@@ -698,7 +714,10 @@ int run_nvfp4(int argc, char** argv) {
             engine.save_recurrent_ckpt();
 
             int32_t pos0 = static_cast<int32_t>(history.size());
-            int32_t b_toks[4], b_p0[4], b_p1[4], preds[4]{};
+            std::vector<int32_t> b_toks(static_cast<size_t>(M));
+            std::vector<int32_t> b_p0(static_cast<size_t>(M));
+            std::vector<int32_t> b_p1(static_cast<size_t>(M));
+            std::vector<int32_t> preds(static_cast<size_t>(M), 0);
             for (int32_t j = 0; j < M; ++j) {
                 int32_t tk = (j == 0) ? next_tok : draft[j - 1];
                 b_toks[j] = tk;
@@ -706,14 +725,17 @@ int run_nvfp4(int argc, char** argv) {
                 b_p1[j] = (history.size() >= 1) ? history[history.size() - 1] : strata::kernels::TOKEN_NULL;
                 history.push_back(tk);
             }
-            (void) engine.step_prefill_batch(b_toks, b_p0, b_p1, M, pos0, true, nullptr, preds,
-                                             &cli_sp, &history, &cli_rng, draft.data());
+            (void) engine.step_prefill_batch(b_toks.data(), b_p0.data(), b_p1.data(), M, pos0, true,
+                                             nullptr, preds.data(), &cli_sp, &history, &cli_rng,
+                                             draft.data());
 
             int32_t accepted = 0;
             while (accepted < K && preds[accepted] == draft[accepted]) {
                 accepted++;
             }
             spec_accepted_total += accepted;
+            spec_max_accepted_k = std::max(spec_max_accepted_k, accepted);
+            spec_max_drafted_k = std::max(spec_max_drafted_k, K);
             const int32_t n_adv = 1 + accepted;
             engine.finish_verify_step(M, n_adv);
             double ver_ms = std::chrono::duration<double, std::milli>(
@@ -721,6 +743,10 @@ int run_nvfp4(int argc, char** argv) {
                                 .count();
             if (!used_mtp) {
                 drafter.observe_step(K, accepted, ver_ms);
+            } else if (ver_ms > 5.0) {
+                const double mtp_overhead = 4.2 * static_cast<double>(K);
+                const double pure_ver = std::max(12.0, ver_ms - mtp_overhead);
+                drafter.observe_step(0, 0, pure_ver / (1.18 + 0.05 * static_cast<double>(K)));
             }
 
             if (accepted < K) {
@@ -759,8 +785,9 @@ int run_nvfp4(int argc, char** argv) {
     int decode_steps = std::max(1, generated - 1);
     std::printf("\n--------------\n");
     if (spec_drafted_total > 0) {
-        std::printf("[gfx1201-nvfp4] spec-ngram: accepted %d / %d drafted tokens (%.1f%%)\n",
-                    spec_accepted_total, spec_drafted_total, 100.0 * spec_accepted_total / spec_drafted_total);
+        std::printf("[gfx1201-nvfp4] spec-ngram: accepted %d / %d drafted tokens (%.1f%%, max_k=%d/%d)\n",
+                    spec_accepted_total, spec_drafted_total, 100.0 * spec_accepted_total / spec_drafted_total,
+                    spec_max_accepted_k, spec_max_drafted_k);
     }
     std::printf("[gfx1201-nvfp4] prefill: %zu tokens in %.3f s (%.2f tok/s) | decode: %d steps in %.3f s (%.2f tok/s, %.2f ms/tok)\n",
                 prompt_ids.size(), prefill_s, prompt_ids.size() / prefill_s,
