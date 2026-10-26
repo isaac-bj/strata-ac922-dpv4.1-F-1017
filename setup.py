@@ -731,7 +731,7 @@ DSV41_SHARED = {
 }
 DSV41_ALL_FILES = {**DSV41_FILES, **DSV41_ISTA_FILES, **DSV41_LEGACY_FILES}
 DSV41_PROFILES = ROOT / "data" / "dsv41"           # the shipped hot-expert profiles (profile-2.00.bin, profile-2.25.bin, + .sha256)
-DSV41_CONTEXT = 8192          # the context the engine was checked at (4096 and 8192; 64K is not tried yet)
+DSV41_CONTEXT = 1048576       # DeepSeek-V4.1-Flash's native YaRN context (verified on the AC922/V100 source build)
 MULTI_FILE_FAMILIES = {
     "deepseek41": {"title": "DeepSeek-V4.1-Flash", "by": "DeepSeek; the 2-bit GGUFs by IST-DAS, UD-Q8_K_XL by Unsloth", "arch": "deepseek41",
                    "about": "a big model that runs on a PC with a 12 GB card and 64 GB of RAM (the two official 2-bit versions: 257 or "
@@ -8246,8 +8246,15 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     # its own choice for several), so no --prefill-chunk is written.  --dspark-conf 0.65: the
     # drafts' confidence floor (H100 replay, DSPARK-DEFAULTS.md: within 0.01-0.02 of the per-class best, never below 0.3).  The engine has
     # no flag for the draft block (3 in the same table): it reads the block size from the pack, so only the floor is written.
+    # POWER9 + Volta: the compressed FP4 KV/index architecture makes the native
+    # 1M context fit, but the large parallel-prefill arena leaves too little
+    # workspace for the sm_70 IQ kernels. Windowed prefill keeps 2 GiB free on
+    # every card while still placing the hot routed experts in VRAM.
+    power_v100 = (platform.machine().lower() in ("ppc64", "ppc64le", "powerpc64", "powerpc64le")
+                  and cards and all(str(c.get("arch") or "") == "70" for c in cards))
+    ac922_args = ["--vram-experts", "1", "--reserve-mib", "2048", "--prefill-chunk", "0"] if power_v100 else []
     args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--dspark", "auto",
-            *(["--dspark-conf", "0.65"] if md.get("recipe") == "ista" else []), *plan["args"]]
+            *(["--dspark-conf", "0.65"] if md.get("recipe") == "ista" else []), *plan["args"], *ac922_args]
     cfg = {"exe": str(exe), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": fam["name"], "arch": fam["arch"], "log": str(home() / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port, "engine_ready_s": 3600}      # 300+ GB read from the files: a slow disk needs its time

@@ -66,21 +66,23 @@ For the IST-DAS 1.75 bpw pack on six 16 GB V100s, keep a real CUDA workspace
 instead of allowing the prompt chunk buffers to consume nearly all VRAM:
 
 ```text
---max-context 4096
+--max-context 1048576
 --vram-experts 1
 --reserve-mib 2048
 --prefill-chunk 0
 ```
 
-This places roughly 79 GB of routed experts in VRAM and keeps roughly 43 GB in
+This places roughly 76 GB of routed experts in VRAM and keeps roughly 46 GB in
 POWER9 system memory, while leaving about 2 GB free on each GPU for inference
 workspaces. On the tested AC922, the default 4096-token prompt chunk left only
 tens of MiB free per card and failed at the first request. Windowed prefill
 (`--prefill-chunk 0`) is slower for long prompts but stable on Volta. The 4096
 context configuration measured about 19 prompt tokens/s and 21 decode tokens/s
 on a cold short request, versus about 3.5 decode tokens/s with all routed
-experts forced to the CPU. An 8192 context also ran successfully, but measured
-about 13 decode tokens/s on the same short check.
+experts forced to the CPU. The native 1,048,576-token context uses the model's
+compressed FP4 KV and sparse index caches (roughly 0.2--0.5 GB per card in the
+tested layer split) and measured about 19 prompt tokens/s and 18 decode tokens/s
+on the same cold short check.
 
 ## Notes
 
