@@ -67,21 +67,25 @@ instead of allowing the prompt chunk buffers to consume nearly all VRAM:
 
 ```text
 --max-context 1048576
+--cpu-threads 40
 --vram-experts 1
---reserve-mib 2048
---prefill-chunk 256
+--reserve-mib 600
+--prefill-chunk 128
 ```
 
-This places roughly 71 GB of routed experts in VRAM and keeps roughly 51 GB in
-POWER9 system memory, while leaving about 2 GB free on each GPU for inference
+This places roughly 81 GB of routed experts in VRAM and keeps roughly 41 GB in
+POWER9 system memory, while leaving about 600 MiB free on each GPU for inference
 workspaces. On the tested AC922, the default 4096-token prompt chunk left only
-tens of MiB free per card and failed at the first request. A 256-token chunk
-retains the parallel prompt path without exhausting Volta memory. A 2,919-token
-prompt measured 211.8 prompt tokens/s and 37.9 decode tokens/s. A short cold
-request measured 16.4 prompt tokens/s and 18.5 decode tokens/s. The native
+tens of MiB free per card and failed at the first request. A 128-token chunk
+retains the parallel prompt path without exhausting Volta memory. A 2,920-token
+prompt measured 336.3 prompt tokens/s and 43.9 decode tokens/s. A 256-token
+output request measured 35.9 decode tokens/s. The native
 1,048,576-token context uses the model's compressed FP4 KV and sparse index
 caches (roughly 0.2--0.5 GB per card in the tested layer split), so it does not
 reserve a dense 1M-token KV cache up front.
+
+For LAN access, bind only the server's LAN address rather than every interface,
+for example `--host 192.168.100.149`. Add an API key if the LAN is not trusted.
 
 ## Notes
 

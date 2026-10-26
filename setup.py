@@ -8248,11 +8248,13 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     # no flag for the draft block (3 in the same table): it reads the block size from the pack, so only the floor is written.
     # POWER9 + Volta: the compressed FP4 KV/index architecture makes the native
     # 1M context fit, but the default large parallel-prefill arena leaves too
-    # little workspace for the sm_70 IQ kernels. A 256-token chunk keeps 2 GiB
-    # free on every card while retaining parallel prefill and hot GPU experts.
+    # little workspace for the sm_70 IQ kernels. The measured 128-token chunk
+    # keeps 600 MiB free per card while retaining parallel prefill and more hot
+    # GPU experts. Forty CPU threads cover the two 21-core POWER9 sockets.
     power_v100 = (platform.machine().lower() in ("ppc64", "ppc64le", "powerpc64", "powerpc64le")
                   and cards and all(str(c.get("arch") or "") == "70" for c in cards))
-    ac922_args = ["--vram-experts", "1", "--reserve-mib", "2048", "--prefill-chunk", "256"] if power_v100 else []
+    ac922_args = ["--cpu-threads", "40", "--vram-experts", "1", "--reserve-mib", "600",
+                  "--prefill-chunk", "128"] if power_v100 else []
     args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--dspark", "auto",
             *(["--dspark-conf", "0.65"] if md.get("recipe") == "ista" else []), *plan["args"], *ac922_args]
     cfg = {"exe": str(exe), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
