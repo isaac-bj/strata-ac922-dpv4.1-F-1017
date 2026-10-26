@@ -157,6 +157,7 @@ Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL
 | **Intel Arc · Linux** | [Intel setup](docs/INTEL_ARC.md) |
 | **Apple Silicon · M1 or newer** | [Mac setup](docs/MAC.md) |
 | **AMD Ryzen AI Max · Strix Halo** | [Strix Halo setup](docs/STRIX_HALO.md) |
+| **IBM AC922 · POWER9 + Tesla V100 · experimental** | [AC922 source build](docs/IBM_AC922.md) |
 
 <a id="using-it"></a>
 

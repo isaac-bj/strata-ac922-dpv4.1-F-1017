@@ -10,7 +10,7 @@
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <immintrin.h>
-#else
+#elif defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
 #endif
 #include <fstream>
@@ -20,6 +20,15 @@ namespace strata::kernels::cpu {
 namespace {
 ExpertLayout g_layout;
 }
+
+#if !defined(__x86_64__) && !defined(__i386__) && !defined(_M_X64) && !defined(_M_IX86)
+static inline int __get_cpuid_count(unsigned, unsigned, unsigned* a, unsigned* b, unsigned* c, unsigned* d) {
+    *a = *b = *c = *d = 0;
+    return 0;
+}
+#define __cpuid_count(leaf, sub, a, b, c, d) do { (void) (leaf); (void) (sub); (a) = (b) = (c) = (d) = 0; } while (0)
+#define __cpuid(leaf, a, b, c, d) do { (void) (leaf); (a) = (b) = (c) = (d) = 0; } while (0)
+#endif
 
 const ExpertLayout& expert_layout() { return g_layout; }
 
@@ -61,7 +70,7 @@ bool cpu_avx512_ok() {
         const unsigned long long xcr0 = _xgetbv(0);
 #else
         unsigned lo = 0, hi = 0;
-#if !defined(__aarch64__)   // arm64 (the Metal build): no XCR0; cpuid reads zero there, so this is never reached
+#if defined(__x86_64__) || defined(__i386__)
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
 #endif
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
@@ -95,7 +104,7 @@ bool cpu_avx512bw_ok() {
         const unsigned long long xcr0 = _xgetbv(0);
 #else
         unsigned lo = 0, hi = 0;
-#if !defined(__aarch64__)   // arm64 (the Metal build): no XCR0; cpuid reads zero there, so this is never reached
+#if defined(__x86_64__) || defined(__i386__)
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
 #endif
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
@@ -131,7 +140,7 @@ bool cpu_avx2_ok() {
         const unsigned long long xcr0 = _xgetbv(0);
 #else
         unsigned lo = 0, hi = 0;
-#if !defined(__aarch64__)   // arm64 (the Metal build): no XCR0; cpuid reads zero there, so this is never reached
+#if defined(__x86_64__) || defined(__i386__)
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
 #endif
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;

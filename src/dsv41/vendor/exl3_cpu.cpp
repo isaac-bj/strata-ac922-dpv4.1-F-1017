@@ -60,6 +60,9 @@ using strata::kernels::f16_from_f32;
 namespace {
 
 constexpr uint32_t kMul1 = 0x83DCD12Du;
+// The optimized GEMM implementations are x86-only, but the portable fallback
+// still exposes the same scratch-size ABI on POWER and other architectures.
+constexpr int kGemmK = 256;
 
 float k_inv() { return f32_from_f16(0x1eee); }
 float k_zero() { return 1024.0f * f32_from_f16(0x1eee) + f32_from_f16(0xc931); }   // w = s * k_inv + k_zero
@@ -320,8 +323,6 @@ EXL3_AVX512 void rows_avx512_n(const Exl3Part& m, const float* const* xh, int ks
 // (wc, in L2), then multiplied as a GEMM: tiles of TB activations x 64 columns, the sums in registers, two FMAs a
 // load.  The prompt path's CPU rows, where an expert serves tens to hundreds of tokens: one decode (~6 instructions a
 // 16-weight row) for all of them instead of one per kExl3CpuMaxN.
-constexpr int kGemmK = 256;
-
 template <int K>
 EXL3_AVX512 void decode_chunk(const Exl3Part& m, int tc0, int ks0, int ks1, float* wc /* (ks1 - ks0) 16 x 128 */) {
     constexpr int W = 8 * K;
