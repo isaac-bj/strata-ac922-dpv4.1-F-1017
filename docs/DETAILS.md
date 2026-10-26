@@ -632,6 +632,9 @@ the engine (v2 `memory.max` and `memory.high`, v1 `memory.limit_in_bytes`, less 
 `--memory-limit-mib` cap. The startup line `strata generate: memory guard: limit X GiB (source: flag|cgroup|meminfo) ...` names
 the source. It covers parking and session files only, not the startup sizing of the arena, the resident budget or the Windows commit check.
 
+With `STRATA_STAGE_COPY_PARALLEL=1`, independent layer-split stages capture and restore through persistent workers.
+Parallel copies are off by default and do not change prompt admission. See [BATCHING.md](BATCHING.md) for the copy switches.
+
 Snapshots hold running state, checkpoints, used K/V pages and draft-layer K/V. They add host RAM, not VRAM. Oldest parked entries
 are evicted first. A new conversation that starts at a checkpoint inside a parked one (sub-agents that share a system prompt)
 restores that prefix and leaves the parked conversation in place (the log says "borrowed"). Oversized snapshots or host
