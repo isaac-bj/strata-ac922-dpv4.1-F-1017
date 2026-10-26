@@ -69,20 +69,19 @@ instead of allowing the prompt chunk buffers to consume nearly all VRAM:
 --max-context 1048576
 --vram-experts 1
 --reserve-mib 2048
---prefill-chunk 0
+--prefill-chunk 256
 ```
 
-This places roughly 76 GB of routed experts in VRAM and keeps roughly 46 GB in
+This places roughly 71 GB of routed experts in VRAM and keeps roughly 51 GB in
 POWER9 system memory, while leaving about 2 GB free on each GPU for inference
 workspaces. On the tested AC922, the default 4096-token prompt chunk left only
-tens of MiB free per card and failed at the first request. Windowed prefill
-(`--prefill-chunk 0`) is slower for long prompts but stable on Volta. The 4096
-context configuration measured about 19 prompt tokens/s and 21 decode tokens/s
-on a cold short request, versus about 3.5 decode tokens/s with all routed
-experts forced to the CPU. The native 1,048,576-token context uses the model's
-compressed FP4 KV and sparse index caches (roughly 0.2--0.5 GB per card in the
-tested layer split) and measured about 19 prompt tokens/s and 18 decode tokens/s
-on the same cold short check.
+tens of MiB free per card and failed at the first request. A 256-token chunk
+retains the parallel prompt path without exhausting Volta memory. A 2,919-token
+prompt measured 211.8 prompt tokens/s and 37.9 decode tokens/s. A short cold
+request measured 16.4 prompt tokens/s and 18.5 decode tokens/s. The native
+1,048,576-token context uses the model's compressed FP4 KV and sparse index
+caches (roughly 0.2--0.5 GB per card in the tested layer split), so it does not
+reserve a dense 1M-token KV cache up front.
 
 ## Notes
 
