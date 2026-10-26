@@ -1099,9 +1099,11 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawe
 // ------------------------------------------------------------------ start
 setBusy(false);
 renderChat();
-const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
+// /?q=... puts a question into the input (a shortcut); you send it.  Not sent by itself: any page can link here, and a
+// sent request carries this browser's saved API key and the MCP tools turned on here.
+const startQuestion = new URLSearchParams(location.search).get("q");
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; $("input").focus(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();
 
