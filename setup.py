@@ -687,6 +687,7 @@ DSV41_ISTA_REPO = "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF"
 DSV41_ISTA_ENGRAM = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
 DSV41_ISTA_SHARD = "DeepSeek-V4.1-Flash-1017-GSQ-RCO-{quant}-{i:05d}-of-00004.gguf"
 DSV41_DSPARK = "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
+DSV41_MMPROJ = "mmproj-BF16.gguf"                 # the model's vision tower (clip, projector deepseek41v): the dsv41 engine reads pictures itself
 DSV41_ISTA_FILES = {
     "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf": (39358830464, "6e3f0d5ff53d00428ec32c079db9e8255cb410ccaa435e5342aaa8a47fe1339d"),
     "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00002-of-00004.gguf": (39176113248, "34d68c99fdae9948f9f0af0dafe308e805ce0a78d2c48641b24cc57242fdc0af"),
@@ -726,6 +727,7 @@ DSV41_LEGACY_NAMES = {
 # the files every official set shares (name -> where it comes from); they live in models/deepseek-v4.1-flash-shared, once
 DSV41_SHARED = {
     DSV41_ISTA_ENGRAM: hf(DSV41_ISTA_REPO),
+    DSV41_MMPROJ: hf(DSV41_REPO),
     DSV41_SHARD.format(i=1): hf(DSV41_REPO) + "UD-Q8_K_XL/",      # only its metadata is read (pack_gguf --engram-meta)
     DSV41_DSPARK: hf(DSV41_REPO),
 }
@@ -741,7 +743,7 @@ MULTI_FILE_FAMILIES = {
                    "models": {"UD-Q8_K_XL": {"about": "Unsloth Dynamic 8-bit: the experts in MXFP4 as DeepSeek made them, the rest "
                                                        "in BF16 (the checkpoint's own precision)",
                               "ram_gb": 306, "shards": [DSV41_SHARD.format(i=i) for i in range(1, 10)]}},
-                   "sha256": DSV41_ALL_FILES, "vision": False}
+                   "sha256": DSV41_ALL_FILES, "vision": True}
 }
 # The official sets first (a normal PC), Unsloth's 508 GB set last.  Each model: its shards, the sub-folder they are in at the repository
 # (and in a --gguf-dir folder), the files shared with the other set ("shared"), the pack recipe and the shipped expert profile.
@@ -753,21 +755,21 @@ MULTI_FILE_FAMILIES["deepseek41"]["models"] = {
                  "perplexity (code and agent work 5-9%)",
         "ram_gb": 40, "recipe": "ista", "subdir": None, "legacy_subdir": "2.00bpw", "profile": "profile-2.00.bin", "hf": hf(DSV41_ISTA_REPO),
         "shards": [DSV41_ISTA_SHARD.format(quant="IQ2_XXS", i=i) for i in range(1, 5)],
-        "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK]},
+        "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK, DSV41_MMPROJ]},
     "IST-DAS-2.25bpw": {
         "label": "IST-DAS 2.25 bpw",
         "about": "the better official version: 155 GB of model + 111 GB n-gram table + 8 GB drafter (274 GB of disk, 17 GB more than "
                  "2.00). About the same speed; quality about 7.3% above the original model's perplexity (code and agent work 2-3%)",
         "ram_gb": 44, "recipe": "ista", "subdir": None, "legacy_subdir": "2.25bpw", "profile": "profile-2.25.bin", "hf": hf(DSV41_ISTA_REPO),
         "shards": [DSV41_ISTA_SHARD.format(quant="IQ2_XS", i=i) for i in range(1, 5)],
-        "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK]},
+        "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK, DSV41_MMPROJ]},
     "IST-DAS-1.75bpw": {
         "label": "IST-DAS 1.75 bpw",
         "about": "the smallest official version: 121 GB of model + 111 GB n-gram table + 8 GB drafter (239 GB of disk, 18 GB less than 2.00). Runs "
                  "where 2.00 is tight (a 12 GB card and 32-40 GB of RAM). Smallest: fine for code and agent work, noticeably weaker on plain prose; pick 2.00 if it fits",
         "ram_gb": 34, "recipe": "ista", "subdir": None, "legacy_subdir": None, "profile": "profile-2.00.bin", "hf": hf(DSV41_ISTA_REPO),
         "shards": [DSV41_ISTA_SHARD.format(quant="IQ1_M", i=i) for i in range(1, 5)],
-        "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK]},
+        "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK, DSV41_MMPROJ]},
     "UD-Q8_K_XL": {
         "label": "Unsloth UD-Q8_K_XL",
         "about": "Unsloth Dynamic 8-bit: the experts in MXFP4 as DeepSeek made them, the rest in BF16 (the checkpoint's own precision); "
@@ -8007,14 +8009,16 @@ def dsv41_find_shared(a, name: str, folder: Path, shared: Path) -> Path:
     return shared / name
 
 
-def dsv41_pack_cmd(folder: Path, shards: list, engram: Path, meta: Path, dspark: Path, pack: Path) -> list:
+def dsv41_pack_cmd(folder: Path, shards: list, engram: Path, meta: Path, dspark: Path, pack: Path,
+                   mmproj: Path | None = None) -> list:
     """The pack recipe for an official IST-DAS set - this and nothing else: another one (--skip-tensors / --dense-override + engram_fold)
     packs without an error and gives garbage text (P2003, 2026-10-23).  The drafter's noise token (128799) and markov rank (256) are stated:
     the IST-DAS GGUFs do not carry them, and a pack with noise id 0 drafts deep less often (decode ~10% slower with DSpark).  --shards names the four files, so an Engram or another
     set in the same folder is not read as part of the model."""
     return [sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--shards", *[Path(n).name for n in shards],
             "--engram", str(engram), "--engram-meta", str(meta), "--dspark-gguf", str(dspark),
-            "--dspark-noise-token", "128799", "--dspark-markov-rank", "256", "--out", str(pack)]
+            "--dspark-noise-token", "128799", "--dspark-markov-rank", "256",
+            *(["--mmproj", str(mmproj)] if mmproj is not None else []), "--out", str(pack)]
 
 
 def dsv41_engine_env(lib_dirs) -> dict:
@@ -8207,7 +8211,9 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
             have_pack = False
     if not have_pack:
         if ista:
-            run(dsv41_pack_cmd(folder, [f.name for f in shards], shared[0], shared[1], shared[2], pack))
+            named = {f.name: f for f in shared}
+            run(dsv41_pack_cmd(folder, [f.name for f in shards], named[DSV41_ISTA_ENGRAM],
+                               named[DSV41_SHARD.format(i=1)], named[DSV41_DSPARK], pack, named.get(DSV41_MMPROJ)))
         else:
             run([sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--out", str(pack)])
     if ista:
