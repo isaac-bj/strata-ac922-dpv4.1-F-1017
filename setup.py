@@ -8256,7 +8256,8 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
                   and cards and all(str(c.get("arch") or "") == "70" for c in cards))
     ac922_args = ["--vram-experts", "1", "--reserve-mib", "700", "--prefill-chunk", "128"] if power_v100 else []
     args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--dspark", "auto",
-            *(["--dspark-conf", "0.65"] if md.get("recipe") == "ista" else []), *plan["args"], *ac922_args]
+            *(["--dspark-conf", "0.50" if power_v100 else "0.65"] if md.get("recipe") == "ista" else []),
+            *plan["args"], *ac922_args]
     cfg = {"exe": str(exe), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": fam["name"], "arch": fam["arch"], "log": str(home() / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port, "engine_ready_s": 3600}      # 300+ GB read from the files: a slow disk needs its time

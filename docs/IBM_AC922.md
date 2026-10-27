@@ -67,6 +67,7 @@ instead of allowing the prompt chunk buffers to consume nearly all VRAM:
 
 ```text
 --max-context 1048576
+--dspark-conf 0.50
 --vram-experts 1
 --reserve-mib 700
 --prefill-chunk 128
@@ -94,6 +95,16 @@ threads. The same 256-token output test improved from 35.9 to 39.4 tokens/s;
 a 2,919-token prompt measured 343.7 prompt tokens/s. `/proc/<pid>/numa_maps`
 showed host pages only on nodes 0 and 8, so an extra `numactl --membind` wrapper
 was not needed and CUDA remained free to manage nodes 250--255.
+
+For sustained decode, the tested DSpark confidence floor is 0.50. A 512-token
+deterministic output measured 46.3 tokens/s, against 44.8 at 0.65. The pack's
+native draft block is five tokens; asking for eight does not extend it. A 0.30
+floor produced more rejected drafts and fell to 43.1 tokens/s. Reducing routed
+experts to four measured 46.0 tokens/s and visibly damaged the answer, so the
+full-quality expert rule remains enabled. On this build the observed single-
+stream ceiling was about 46 tokens/s overall and 58.7 tokens/s in a fully
+predictable segment; 80--100 tokens/s requires a longer trained drafter or a
+different model/precision path, not another safe runtime flag.
 
 For LAN access, bind only the server's LAN address rather than every interface,
 for example `--host 192.168.100.149`. Add an API key if the LAN is not trusted.
