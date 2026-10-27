@@ -1926,8 +1926,12 @@ struct Model::Impl {
                 const int ty = gg_type_of(kv.second.dtype);
                 if (ty >= 0) blk = std::max(blk, gg::type_block(ty));
             }
-            while (tp > 1 && (g.ff % tp != 0 || (g.ff / tp) % blk != 0 || (g.ff / tp) % (std::getenv("DS4_TP_ALIGN") ? std::atoi(std::getenv("DS4_TP_ALIGN")) : 128) != 0 || g.heads % tp != 0 ||
-                              g.o_groups % tp != 0))
+            // Attention does not need every expert-parallel member: head_members(tp) deliberately
+            // chooses the largest compatible subset (for example two head workers in a three-way
+            // expert group).  Requiring the heads to divide by the full group here made that path
+            // unreachable and reduced valid 3-way GGUF expert splits to one device.
+            while (tp > 1 && (g.ff % tp != 0 || (g.ff / tp) % blk != 0 ||
+                              (g.ff / tp) % (std::getenv("DS4_TP_ALIGN") ? std::atoi(std::getenv("DS4_TP_ALIGN")) : 128) != 0))
                 --tp;
             if (tp != o.tp)
                 std::fprintf(stderr, "ds4: tensor parallel %d -> %d: the experts' %d-value blocks split n_ff %d no other way "
@@ -1947,21 +1951,46 @@ struct Model::Impl {
                      ((o.prefill_chunk > 0 || (o.prefill_chunk < 0 && kChunkedPromptDefault)) &&
                       std::getenv("DS4_WINDOWS") == nullptr);
         const bool tp_all = tp > 1 && tp == (int) devs.size();
-        for (size_t i = 0; i < devs.size();) {
-            Group G;
-            G.mem.push_back((int) i);
-            size_t j = i + 1;
-            while ((int) G.mem.size() < tp && j < devs.size() && (tp_all || devs[j].total == devs[i].total))
-                G.mem.push_back((int) j++);
-            if ((int) G.mem.size() < tp && G.mem.size() > 1) {   // a short run at the end: devices of their own
-                for (int m : G.mem) {
-                    Group one;
-                    one.mem.push_back(m);
-                    groups.push_back(one);
+        if (const char* spec = std::getenv("DS4_TP_GROUPS")) {
+            std::vector<int> widths;
+            int sum = 0;
+            for (const char* q = spec; *q;) {
+                const int n = std::atoi(q);
+                if (n < 1 || n > tp) {
+                    err = std::string("DS4_TP_GROUPS has an invalid group width: ") + spec;
+                    return false;
                 }
-            } else groups.push_back(G);
-            i = j;
-        }
+                widths.push_back(n);
+                sum += n;
+                while (*q && *q != ',') ++q;
+                if (*q == ',') ++q;
+            }
+            if (sum != (int) devs.size()) {
+                err = std::string("DS4_TP_GROUPS must account for every visible GPU: ") + spec;
+                return false;
+            }
+            int at = 0;
+            for (int n : widths) {
+                Group G;
+                for (int j = 0; j < n; ++j) G.mem.push_back(at++);
+                groups.push_back(std::move(G));
+            }
+            std::fprintf(stderr, "ds4: tensor-parallel group widths: %s\n", spec);
+        } else for (size_t i = 0; i < devs.size();) {
+                Group G;
+                G.mem.push_back((int) i);
+                size_t j = i + 1;
+                while ((int) G.mem.size() < tp && j < devs.size() && (tp_all || devs[j].total == devs[i].total))
+                    G.mem.push_back((int) j++);
+                if ((int) G.mem.size() < tp && G.mem.size() > 1) {   // a short run at the end: devices of their own
+                    for (int m : G.mem) {
+                        Group one;
+                        one.mem.push_back(m);
+                        groups.push_back(one);
+                    }
+                } else groups.push_back(G);
+                i = j;
+            }
         for (size_t gi = 0; gi < groups.size(); ++gi)
             for (size_t m = 0; m < groups[gi].mem.size(); ++m) {
                 devs[(size_t) groups[gi].mem[m]].grp = (int) gi;
@@ -2441,7 +2470,9 @@ struct Model::Impl {
         // host-mapped, the steps' slots
         // (only where every member holds its rows of the markov head: a type load_dense does not take keeps the lead's)
         bool mk_rows = g.n_mtp > 0 && head_nm() > 1;
-        for (int m : groups[(size_t) devs[(size_t) head_dev].grp].mem) mk_rows = mk_rows && devs[(size_t) m].mk_share != nullptr;
+        const auto& hmem = groups[(size_t) devs[(size_t) head_dev].grp].mem;
+        for (int mi = 0; mi < head_nm(); ++mi)
+            mk_rows = mk_rows && devs[(size_t) hmem[(size_t) mi]].mk_share != nullptr;
         if (mk_rows && !(std::getenv("DS4_MK_SPLIT") != nullptr && std::atoi(std::getenv("DS4_MK_SPLIT")) == 0)) {
             const Tensor* te = pk.get("mtp." + std::to_string(g.n_mtp - 1) + ".markov_head.embed.weight");
             if (te == nullptr || te->dtype != "BF16" || te->bytes != (uint64_t) g.vocab * g.d_rank * 2) {
@@ -3764,7 +3795,7 @@ struct Model::Impl {
             }
             if (!dalloc(d, l.vram_tab, (size_t) l.n_exp, err, acct)) return false;
           }
-        if (d.grp == devs[(size_t) head_dev].grp) {   // the head: each member of its group a share of the columns
+        if (d.grp == devs[(size_t) head_dev].grp && d.mi < head_nm()) {   // compatible members share the head columns
             const int hn = head_nm();
             if (!mat(d, "head", d.head, err, acct, d.mi, hn, true) || !f32(d, "norm.weight", d.norm_w, err, acct, (size_t) g.dim))
                 return false;
@@ -6803,8 +6834,9 @@ struct Model::Impl {
         }
         // the drafter's final norm and the trunk's head, on every member of the head group (the others' shares first)
         const std::vector<int>& hg = groups[(size_t) hd.grp].mem;
+        const int hnm = head_nm();
         const bool mk = mk_split && !drafts_q;   // (sampled drafts: the lead's whole rows, gathered)
-        for (int m = (int) hg.size() - 1; m >= 0; --m) {
+        for (int m = hnm - 1; m >= 0; --m) {
             Dev& e = devs[(size_t) hg[(size_t) m]];
             cudaSetDevice(e.id);
             if (m > 0) {
@@ -6823,7 +6855,7 @@ struct Model::Impl {
             // the markov steps over the group: each member its rows of the bias and its share's argmax, every member
             // then the global one (the sampler's tie rule) and its E row - the same drafts as the lead's whole rows,
             // each step ~1/nm of their 66 MB and no gather of the shares
-            const int nm = (int) hg.size();
+            const int nm = hnm;
             const unsigned seq = ++mk_seq;
             for (int m = 0; m < nm; ++m) {
                 Dev& e = devs[(size_t) hg[(size_t) m]];
@@ -7782,7 +7814,7 @@ struct Model::Impl {
                 CK(cudaEventRecord(chunk_done[(size_t) k], s));
                 chunk_rec[(size_t) k].store(1, std::memory_order_release);
             }
-            if (d.grp == devs[(size_t) head_dev].grp) {   // the head group: each member its share of the logits
+            if (d.grp == devs[(size_t) head_dev].grp && d.mi < head_nm()) {   // compatible head members only
                 if (logits_all) {   // every row's logits (tests): the head over the chunk's rows, 16 at a time
                     const size_t base = (size_t) (p0 - run.p0[0]) * g.vocab;
                     for (int r0 = 0; r0 < T; r0 += kWin) {
@@ -8504,7 +8536,16 @@ struct Model::Impl {
         }
     }
 
-    int head_nm() const { return (int) groups[(size_t) devs[(size_t) head_dev].grp].mem.size(); }
+    int head_nm() const {
+        int nm = (int) groups[(size_t) devs[(size_t) head_dev].grp].mem.size();
+        const Tensor* tw = pk.get("head.weight");
+        // BF16/Q8 rows are split evenly.  Expert TP may have a width (notably 3
+        // for a 2304-wide, 256-block GGUF expert) that the vocabulary cannot
+        // divide; use the largest compatible prefix of the group for the head.
+        if (tw != nullptr)   // every GGUF matrix format here needs equal row shares
+            while (nm > 1 && g.vocab % nm != 0) --nm;
+        return nm;
+    }
     // the head's columns on member mi of its group of nm: an EXL3 head's split128 of the vocabulary (mat's), a GGUF's
     // BF16 / Q8_0 head's even shares (mat_bf16's) - head_share's, its gather's and the markov steps' rows
     void head_cols(int nm, int mi, int& v0, int& vn) const {
@@ -8793,7 +8834,7 @@ struct Model::Impl {
             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
             if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
         }
-        if (d.grp == devs[(size_t) head_dev].grp) return head_rows_dev(di, T, err);
+        if (d.grp == devs[(size_t) head_dev].grp && d.mi < head_nm()) return head_rows_dev(di, T, err);
         return true;
     }
 
