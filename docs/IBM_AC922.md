@@ -68,12 +68,13 @@ instead of allowing the prompt chunk buffers to consume nearly all VRAM:
 ```text
 --max-context 1048576
 --vram-experts 1
---reserve-mib 600
+--reserve-mib 700
 --prefill-chunk 128
 ```
 
 This places roughly 81 GB of routed experts in VRAM and keeps roughly 41 GB in
-POWER9 system memory, while leaving about 600 MiB free on each GPU for inference
+POWER9 system memory. The 700 MiB allocator reserve leaves about 600 MiB
+physically free on each GPU after CUDA's request-time allocations for inference
 workspaces. On the tested AC922, the default 4096-token prompt chunk left only
 tens of MiB free per card and failed at the first request. A requested 128-token
 chunk (internally aligned to 256) retains the parallel prompt path without
