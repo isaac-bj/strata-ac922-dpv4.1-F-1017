@@ -84,6 +84,16 @@ output request measured 35.9 decode tokens/s. The native
 caches (roughly 0.2--0.5 GB per card in the tested layer split), so it does not
 reserve a dense 1M-token KV cache up front.
 
+AC922 exposes sparse Linux NUMA IDs: the POWER9 CPU memory nodes are 0 and 8,
+while V100 memory appears as nodes 250--255. Strata enumerates the kernel's
+online-node list instead of stopping at the missing node 1, and binds copied
+CPU-lane expert halves to the real CPU node IDs. On the tested machine this
+changed the expert lane from one NUMA part and 20 threads to two parts and 42
+threads. The same 256-token output test improved from 35.9 to 39.4 tokens/s;
+a 2,919-token prompt measured 343.7 prompt tokens/s. `/proc/<pid>/numa_maps`
+showed host pages only on nodes 0 and 8, so an extra `numactl --membind` wrapper
+was not needed and CUDA remained free to manage nodes 250--255.
+
 For LAN access, bind only the server's LAN address rather than every interface,
 for example `--host 192.168.100.149`. Add an API key if the LAN is not trusted.
 

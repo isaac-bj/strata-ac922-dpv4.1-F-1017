@@ -114,6 +114,10 @@ std::vector<int> cpu_list(const std::string& s) {   // "0-3,8,10-11"
     }
     return v;
 }
+// The OS NUMA ids that correspond to node_cores()' entries. Linux NUMA ids can
+// be sparse (POWER9 AC922: CPU nodes 0 and 8, GPU memory nodes 250..255), so an
+// entry's ordinal must not be passed to mbind as though it were the OS node id.
+std::vector<int> cpu_numa_ids;
 // each NUMA node's physical cores (the first logical CPU of each core), in order
 std::vector<std::vector<int>> node_cores() {
 #if defined(_WIN32)
@@ -122,29 +126,42 @@ std::vector<std::vector<int>> node_cores() {
         return v != nullptr && std::atoi(v) != 0;
     }();
     std::vector<std::vector<int>> nodes = os::node_cores(smt);
+    cpu_numa_ids.resize(nodes.size());
+    std::iota(cpu_numa_ids.begin(), cpu_numa_ids.end(), 0);
 #else
     std::vector<std::vector<int>> nodes;
-    for (int n = 0; n < 64; ++n) {
+    cpu_numa_ids.clear();
+    std::vector<int> online = cpu_list(read_file("/sys/devices/system/node/online"));
+    if (online.empty())
+        for (int n = 0; n < 256; ++n) online.push_back(n);
+    for (int n : online) {
         const std::string cl = read_file("/sys/devices/system/node/node" + std::to_string(n) + "/cpulist");
-        if (cl.empty()) break;
+        if (cl.empty()) continue;
         std::vector<int> cores;
         for (int c : cpu_list(cl)) {
             const std::vector<int> sib = cpu_list(
                 read_file("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list"));
             if (sib.empty() || sib[0] == c) cores.push_back(c);
         }
-        if (!cores.empty()) nodes.push_back(cores);
+        if (!cores.empty()) {
+            nodes.push_back(cores);
+            cpu_numa_ids.push_back(n);
+        }
     }
 #endif
     if (nodes.empty()) {
         std::vector<int> all;
         for (unsigned c = 0; c < std::max(1u, std::thread::hardware_concurrency() / 2); ++c) all.push_back((int) c);
         nodes.push_back(all);
+        cpu_numa_ids.assign(1, 0);
     }
     return nodes;
 }
 // anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages
-void* node_map(size_t bytes, int node, int n_nodes) { return os::anon_alloc(bytes, node, n_nodes); }
+void* node_map(size_t bytes, int node, int n_nodes) {
+    const int os_node = node >= 0 && (size_t) node < cpu_numa_ids.size() ? cpu_numa_ids[(size_t) node] : node;
+    return os::anon_alloc(bytes, os_node, n_nodes);
+}
 void pin_self(int cpu) { os::pin_self(cpu); }
 // the RAM this process can still get: MemAvailable, and below it the tightest cgroup v2 limit on the way to the root
 // (its limit less what is charged, the page cache counted as free: the kernel takes it back); ~0: not known
