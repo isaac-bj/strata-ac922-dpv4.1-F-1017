@@ -131,6 +131,12 @@ std::vector<std::vector<int>> node_cores() {
 #else
     std::vector<std::vector<int>> nodes;
     cpu_numa_ids.clear();
+    // POWER and some other Linux CPUs expose useful SMT threads for the memory-bound CPU expert lane too.  Keep the
+    // historical one-thread-per-core default; DS4_CPU_SMT=N opts into the first N online siblings of every core.
+    const int smt = [] {
+        const char* v = std::getenv("DS4_CPU_SMT");
+        return v != nullptr ? std::max(1, std::atoi(v)) : 1;
+    }();
     std::vector<int> online = cpu_list(read_file("/sys/devices/system/node/online"));
     if (online.empty())
         for (int n = 0; n < 256; ++n) online.push_back(n);
@@ -141,7 +147,8 @@ std::vector<std::vector<int>> node_cores() {
         for (int c : cpu_list(cl)) {
             const std::vector<int> sib = cpu_list(
                 read_file("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list"));
-            if (sib.empty() || sib[0] == c) cores.push_back(c);
+            const auto it = std::find(sib.begin(), sib.end(), c);
+            if (sib.empty() || (it != sib.end() && it - sib.begin() < smt)) cores.push_back(c);
         }
         if (!cores.empty()) {
             nodes.push_back(cores);
