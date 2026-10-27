@@ -2420,11 +2420,38 @@ struct Model::Impl {
             G.ar.nm = (int) G.mem.size();
             G.ar.slots = 4;
             G.ar.stride = (size_t) kWin * g.dim;
-            if (G.ar.nm > 1 && (!hmap(G.ar.data, (size_t) G.ar.nm * G.ar.slots * G.ar.stride, err) ||
-                                !hmap(G.ar.flags, (size_t) G.ar.nm * G.ar.slots * 32, err)))
+            const bool want_p2p = [] {
+                const char* e = std::getenv("DS4_AR_P2P");
+                return e != nullptr && std::atoi(e) != 0;
+            }();
+            G.ar.p2p = want_p2p && G.ar.nm > 1 && G.ar.nm <= 8;
+            for (int i = 0; G.ar.p2p && i < G.ar.nm; ++i)
+                for (int j = 0; j < G.ar.nm; ++j)
+                    if (i != j) {
+                        int can = 0;
+                        CK(cudaDeviceCanAccessPeer(&can, devs[(size_t) G.mem[(size_t) i]].id,
+                                                   devs[(size_t) G.mem[(size_t) j]].id));
+                        if (!can) G.ar.p2p = false;
+                    }
+            if (G.ar.p2p)
+                for (int i = 0; i < G.ar.nm; ++i) {
+                    Dev& d = devs[(size_t) G.mem[(size_t) i]];
+                    CK(cudaSetDevice(d.id));
+                    for (int j = 0; j < G.ar.nm; ++j)
+                        if (i != j) {
+                            const cudaError_t pe = cudaDeviceEnablePeerAccess(devs[(size_t) G.mem[(size_t) j]].id, 0);
+                            if (pe == cudaErrorPeerAccessAlreadyEnabled) (void) cudaGetLastError();
+                            else if (pe != cudaSuccess) G.ar.p2p = false;
+                        }
+                }
+            if (G.ar.nm > 1 && !hmap(G.ar.flags, (size_t) G.ar.nm * G.ar.slots * 32, err)) return false;
+            if (G.ar.p2p) {
+                for (int i = 0; i < G.ar.nm; ++i)
+                    if (!dalloc(devs[(size_t) G.mem[(size_t) i]], G.ar.peer[i], G.ar.slots * G.ar.stride, err)) return false;
+            } else if (G.ar.nm > 1 && !hmap(G.ar.data, (size_t) G.ar.nm * G.ar.slots * G.ar.stride, err))
                 return false;
             // three members or more: the reduce-scatter's sums and its per-block flags (allreduce)
-            if (G.ar.nm > 2 && (!hmap(G.ar.sums, (size_t) G.ar.slots * G.ar.stride, err) ||
+            if (!G.ar.p2p && G.ar.nm > 2 && (!hmap(G.ar.sums, (size_t) G.ar.slots * G.ar.stride, err) ||
                                 !hmap(G.ar.bflags, (size_t) 2 * G.ar.nm * G.ar.slots * kArBlocks * 8, err)))
                 return false;
             if (G.ar.nm > 1 && &G == &groups[(size_t) devs[(size_t) head_dev].grp] &&
@@ -2434,10 +2461,16 @@ struct Model::Impl {
             G.arb = G.ar;   // (a chunk's: two slots of chunk rows)
             G.arb.slots = 2;
             G.arb.stride = (size_t) chunk * g.dim;
-            if (chunk > 0 && G.arb.nm > 1 && (!hmap(G.arb.data, (size_t) G.arb.nm * G.arb.slots * G.arb.stride, err) ||
-                                              !hmap(G.arb.flags, (size_t) G.arb.nm * G.arb.slots * 32, err)))
-                return false;
-            if (chunk > 0 && G.arb.nm > 2 &&
+            G.arb.data = G.arb.sums = nullptr;
+            G.arb.flags = G.arb.bflags = nullptr;
+            for (float*& p : G.arb.peer) p = nullptr;
+            if (chunk > 0 && G.arb.nm > 1 && !hmap(G.arb.flags, (size_t) G.arb.nm * G.arb.slots * 32, err)) return false;
+            if (chunk > 0 && G.arb.p2p) {
+                for (int i = 0; i < G.arb.nm; ++i)
+                    if (!dalloc(devs[(size_t) G.mem[(size_t) i]], G.arb.peer[i], G.arb.slots * G.arb.stride, err)) return false;
+            } else if (chunk > 0 && G.arb.nm > 1 &&
+                       !hmap(G.arb.data, (size_t) G.arb.nm * G.arb.slots * G.arb.stride, err)) return false;
+            if (chunk > 0 && !G.arb.p2p && G.arb.nm > 2 &&
                 (!hmap(G.arb.sums, (size_t) G.arb.slots * G.arb.stride, err) ||
                  !hmap(G.arb.bflags, (size_t) 2 * G.arb.nm * G.arb.slots * kArBlocks * 8, err)))
                 return false;

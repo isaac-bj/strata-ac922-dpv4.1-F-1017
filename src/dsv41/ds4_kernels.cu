@@ -1712,6 +1712,31 @@ __global__ void __launch_bounds__(kThreads) ar_sum_kernel(float* x, int n4, cons
     }
 }
 
+// ar_sum_kernel's peer-memory counterpart.  The producer copy and its host-mapped flag are published by
+// xfer_put_kernel after a system fence; peer UVA pointers therefore read the rows directly over NVLink.
+__global__ void __launch_bounds__(kThreads) ar_p2p_sum_kernel(float* x, int n4, ArGroup a, int mi, int slot,
+                                                             unsigned seq) {
+    if (threadIdx.x == 0)
+        for (int m = 0; m < a.nm; ++m)
+            if (m != mi) wait_at_least(a.flags + ((size_t) m * a.slots + slot) * 32, seq);
+    __syncthreads();
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x) {
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int m = 0; m < a.nm; ++m) {
+            const float4 p = m == mi ? ((const float4*) x)[q]
+                                     : ld_fresh((const float4*) (a.peer[m] + (size_t) slot * a.stride) + q);
+            if (m == 0) v = p;
+            else {
+                v.x = __fadd_rn(v.x, p.x);
+                v.y = __fadd_rn(v.y, p.y);
+                v.z = __fadd_rn(v.z, p.z);
+                v.w = __fadd_rn(v.w, p.w);
+            }
+        }
+        ((float4*) x)[q] = v;
+    }
+}
+
 
 // a thread a (token, value): every stream's value read before any is written
 __global__ void hc_post_inplace_kernel(const float* __restrict__ y, float* h, const float* __restrict__ post,
@@ -2205,6 +2230,18 @@ void set_flag(unsigned* flag, unsigned v, cudaStream_t s) {
 }
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {
     const int slot = (int) (seq % (unsigned) a.slots);
+    if (a.p2p) {
+        Xfer xp;
+        xp.n = 1;
+        xp.src[0] = x;
+        xp.dst[0] = a.peer[mi] + (size_t) slot * a.stride;
+        xp.bytes[0] = (size_t) n * 4;
+        xfer_put(xp, a.flags + ((size_t) mi * a.slots + slot) * 32, seq, cnt, s);
+        const int n4 = n / 4;
+        const int blocks = std::max(1, std::min(64, cdiv(n4, kThreads)));
+        ar_p2p_sum_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a, mi, slot, seq);
+        return;
+    }
     if (a.nm > 2 && a.sums != nullptr && a.bflags != nullptr) {   // (the reduce-scatter: ar_rs_kernel)
         static const bool f16 = [] {
             const char* e = std::getenv("DS4_AR_F16");

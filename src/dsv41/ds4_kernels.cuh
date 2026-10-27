@@ -304,6 +304,11 @@ struct ArGroup {
     // member order, then reads the others' sums) - [slots][stride] sums, [2][nm][slots][kArBlocks][8] flags
     float* sums = nullptr;
     unsigned* bflags = nullptr;
+    // Optional CUDA peer-memory rows.  Each member owns peer[member]; with peer access enabled every member writes its
+    // local row then reads the others directly over NVLink.  Host-mapped flags retain the existing cross-device
+    // ordering protocol.  Kept opt-in because peer topology/support varies widely.
+    float* peer[8] = {};
+    bool p2p = false;
 };
 constexpr int kArBlocks = 64;
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
